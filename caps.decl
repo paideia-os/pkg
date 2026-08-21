@@ -1,0 +1,61 @@
+# pkg — caps.decl
+#
+# Wave: R49
+# Doc:  design/tooling/r49-r50-plan.md §5.1 in the paideia-os repo.
+#
+# pkg is the R49 package manager. Its M1 milestone (design + skeleton +
+# argv surface + first-runnable pkg list) declares the BASELINE cap set
+# every subcommand invocation receives from the loader's InitCap
+# sidecar (paideia-os src/kernel/core/loader/init_caps.pdx, R20b.M4).
+#
+# The M1 baseline is deliberately narrow: only the ambient caps every
+# subcommand always needs. Write authority on /pkgs/, network fetch
+# authority on pkgs.paideia-os, and signature-verify authority on
+# paideia_root_pk are NOT ambient — they are acquired per-install via
+# libpdx-elevate (M3-004) so pkg never runs with ambient write authority
+# on /pkgs/. That is the D4 discipline in design/tooling/plan.md.
+#
+# Format: `requires:` lists cap-kind names + narrowed rights + optional
+# scope. The M1 pkg-caps-decl reader (shared with every R49/R50 tool at
+# libpdx-cap.M2) resolves each name to its KIND_* ordinal at exec time,
+# matches the loader-seeded cap set against this list, and fails-fast
+# with CAP_MANIFEST_MISSING / CAP_MANIFEST_EXTRA if the two do not agree.
+requires:
+  # Identity root. Every subcommand checks the caller's KIND_USER tail
+  # before it opens a file or emits a record (D3 audit-first, upgraded
+  # from the R48.M1 KIND_USER = 0x190 substrate at
+  # src/kernel/core/cap/kind_user.pdx).
+  - KIND_USER (self)
+
+  # Baseline pipe substrate (R20b, base kind 5). Consumers use it to
+  # emit their own stdout schema records (M3 wires
+  # libpdx-semantic-pipe on top); stdin / stdout / stderr endpoints are
+  # seeded by shell at exec via InitCap.
+  - KIND_IPC_ENDPOINT (invoke)
+
+  # Read authority on /system/packages/ for `pkg list` and its M2
+  # extensions. Narrowed to READ (no write). Bootstrap image ships the
+  # /system/packages/ directory as an empty PdxFS subtree; M2's
+  # pkg_install populates it via a per-install elevated write cap.
+  # KIND_PDXFS_FILE = 0x195 (R42 substrate, landed in paideia-os commit
+  # 411ad0e).
+  - KIND_PDXFS_FILE (read, /system/packages/)
+
+# --- placeholder: elevate-broker binding -------------------------------
+# Reserved for the M3-004 wire-up. Uncomment when libpdx-elevate.M3 is
+# in-tree and the paideia-os elevate broker (R48.M7 at
+# src/kernel/core/ipc/elevate_broker.pdx) is running. In M1 the request
+# path stays on the shelf so `pkg list` does not require an approver
+# hop just to enumerate a directory it already has read authority on.
+#
+#   - KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)   # 0x191 R48.M7
+#
+# The M3 addition changes only this file; every other subcommand keeps
+# its M1 code path unchanged (the elevate request lives inside
+# pkg_install and pkg_remove, which are M2 bodies).
+
+# Declared output schemas — the semantic-pipe schema records this tool
+# emits on its stdout. M1 emits none (list prints text lines only). M3
+# introduces PackageManifest[], InstallProgressRecord[], and
+# KeyFingerprintRecord[] via libpdx-semantic-pipe.
+declares_output_schemas: (none)
