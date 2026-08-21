@@ -1,0 +1,312 @@
+// src/dispatch.pdx — pkg.M1-002
+// Dispatch module: subcommand-name byte-compare + route to a body.
+//
+// Scope
+// -----
+// The M1 argv surface accepts five subcommand names — install, remove,
+// list, verify, keys — with distinct first bytes (i/r/l/v/k). This
+// module byte-compares the caller-supplied name against those five and
+// jumps to the matching body:
+//
+//   install → PkgSubcommandsM1::pkg_install_stub  (M1 stub; M2 body)
+//   remove  → PkgSubcommandsM1::pkg_remove_stub   (M1 stub; M2 body)
+//   list    → PkgList::pkg_list_body              (M1 real body)
+//   verify  → PkgSubcommandsM1::pkg_verify_stub   (M1 stub; M2 body)
+//   keys    → PkgSubcommandsM1::pkg_keys_stub     (M1 stub; M5 body)
+//
+// Everything else prints a "unknown subcommand" diagnostic on stderr
+// and returns exit code 2 (usage error).
+//
+// The comparator uses the inline byte-compare idiom from libpdx-argv's
+// --pdx-schema well-known check (src/parser.pdx in libpdx-argv) —
+// there is no strcmp helper at the R49 substrate. First-byte
+// discrimination cuts the tree: the five vocabulary entries start
+// with five distinct bytes, so a single first-byte compare selects
+// the branch and the remaining bytes are verified inline.
+//
+// M3-002 replaces the hand-rolled "unknown subcommand" diagnostic
+// with a doc-back-end call once `doc pkg` reaches M2 (cross-repo dep
+// in the plan doc §5.1 M3 line).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Dispatch (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (all char codes and lengths
+//     used here are single-byte values ≤ 0x7F).
+//   - r11 is scratch; used in the lea for .rodata string bases.
+//   - The comparator is a leaf w.r.t. its own frame — it calls into
+//     PkgList / PkgSubcommandsM1 / Print but never touches its own
+//     callee-save registers.
+//   - Byte loads use xor rax,rax; mov_b rax,[ptr] per the #1248
+//     mitigation.
+
+module Dispatch = structure {
+
+  // -- Exit codes --------------------------------------------------------
+  pub let EXIT_OK                : u64 = 0
+  pub let EXIT_OP_FAIL           : u64 = 1
+  pub let EXIT_USAGE             : u64 = 2
+  pub let EXIT_NOT_YET_IMPL      : u64 = 3
+
+  // -- Unknown-subcommand diagnostic strings ----------------------------
+  // Emitted on stderr when the caller's subcommand name does not
+  // match any of the five vocabulary entries. Two pieces so the
+  // rendered line is "pkg: unknown subcommand '<name>'\n" — the caller
+  // sits between UNK_PREFIX and UNK_SUFFIX.
+  pub let UNK_PREFIX : [u8; 25]        = "pkg: unknown subcommand '"
+  pub let UNK_PREFIX_LEN : u64         = 25
+  pub let UNK_SUFFIX : [u8; 2]         = "'\n"
+  pub let UNK_SUFFIX_LEN : u64         = 2
+
+  // Short usage string emitted when no subcommand is supplied.
+  pub let USAGE_MSG : [u8; 51]         =
+    "usage: pkg <install|remove|list|verify|keys> [ARG]\n"
+  pub let USAGE_MSG_LEN : u64          = 51
+
+  // -- Dispatch state ---------------------------------------------------
+  // Records which subcommand fired; useful at M3 for the audit-first
+  // journal record that has to name the subcommand before any output.
+  // Values: 0 = none, 1 = install, 2 = remove, 3 = list, 4 = verify,
+  // 5 = keys, 0xFF = unknown.
+  pub let mut chosen_subcommand : u64 = uninit @align(8)
+
+  // ============================================================================
+  // dispatch_reset()
+  //
+  // Signature: dispatch_reset : () -> () !{mem} @{}
+  //
+  // Clear chosen_subcommand so a subsequent dispatch_subcommand call
+  // starts from a known-zero baseline. Called by pkg_main before it
+  // hands the subcommand string to dispatch_subcommand.
+  // ============================================================================
+  pub let dispatch_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M1-002 dispatch_reset. Zero chosen_subcommand so dispatch_subcommand starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf; r11 scratch used only for the lea.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + chosen_subcommand];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dispatch_no_subcommand() -> exit_code
+  //
+  // Signature: dispatch_no_subcommand : () -> u64 !{mem, sysreg} @{}
+  // RAX (output): 2 (EXIT_USAGE)
+  //
+  // Called by pkg_main when ParsedArgs::pos_count == 0. Prints the
+  // short usage string on stderr and returns 2.
+  //
+  // 1-push prologue (rbx) for the nested Print::print_err call.
+  // ============================================================================
+  pub let dispatch_no_subcommand : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M1-002 dispatch_no_subcommand. Print USAGE_MSG on stderr; return EXIT_USAGE (2). rsp%16 was 8 on SysV entry; push rbx aligns to 0 for the nested syscall. rbx unused body-side but preserved for parity with the other dispatch entries.",
+      block: {
+        push rbx;
+        lea rdi, [rip + USAGE_MSG];
+        mov rsi, 51;                           // USAGE_MSG_LEN
+        call Print::print_err;
+        pop rbx;
+        mov rax, 2;                            // EXIT_USAGE
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dispatch_subcommand(name_ptr) -> exit_code
+  //
+  // Signature: dispatch_subcommand : (u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): name_ptr — VA of a NUL-terminated subcommand string
+  // RAX (output): exit code from the matched body, or 2 for unknown
+  //
+  // Comparator:
+  //   read byte0. First-byte switch:
+  //     'i' (0x69) → verify install: n(0x6E) s(0x73) t(0x74) a(0x61)
+  //                                  l(0x6C) l(0x6C) NUL
+  //     'r' (0x72) → verify remove:  e(0x65) m(0x6D) o(0x6F) v(0x76)
+  //                                  e(0x65) NUL
+  //     'l' (0x6C) → verify list:    i(0x69) s(0x73) t(0x74) NUL
+  //     'v' (0x76) → verify verify:  e(0x65) r(0x72) i(0x69) f(0x66)
+  //                                  y(0x79) NUL
+  //     'k' (0x6B) → verify keys:    e(0x65) y(0x79) s(0x73) NUL
+  //     else       → dispatch_unknown
+  //
+  // Each per-branch verification is a linear cmp on each subsequent
+  // byte; any mismatch jumps to dispatch_unknown. On a full match,
+  // chosen_subcommand is set and the corresponding body is called.
+  // Because the body's return value is our own return value, we tail-
+  // call rather than push/pop around the call. The pattern matches
+  // libpdx-argv's pdx-schema check inline compare.
+  //
+  // Prologue: 1 push (rbx). rbx holds the name_ptr across the byte
+  // compares so rdi is free to be argument-1 for the body's print
+  // calls; the rbx save also aligns rsp%16 to 0 for the nested body
+  // calls.
+  //
+  // Register plan:
+  //   rbx = name_ptr (preserved across all byte compares + body call)
+  //   rax = byte-load scratch / return value from body
+  //   rdx = walk cursor (rbx + offset) for the byte compares
+  //   r11 = lea scratch (for chosen_subcommand writes)
+  // ============================================================================
+  pub let dispatch_subcommand : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (name_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M1-002 dispatch_subcommand. First-byte switch over the five M1 vocabulary entries (install/remove/list/verify/keys — distinct first bytes i/r/l/v/k). Per-branch linear inline byte-compare (same idiom as libpdx-argv's --pdx-schema check in src/parser.pdx). Any mismatch jumps to dispatch_unknown. On full match: write chosen_subcommand tag then call the body; tail-return the body's exit code. Prologue: 1 push (rbx) preserves name_ptr and aligns rsp%16 to 0 for the nested body calls. rdx is the walk cursor: mov rdx, rbx; add rdx, <offset>; xor rax, rax; mov_b rax, [rdx] — the paideia-as #1248 mitigation pattern. Every cmp uses an immediate ≤ 0x7F (single-byte char codes). Epilogue: pop rbx before ret so rsp is caller-clean; the body's rax passes through untouched.",
+      block: {
+        // Prologue: preserve name_ptr in rbx.
+        push rbx;
+        mov rbx, rdi;
+
+        // First-byte switch.
+        xor rax, rax;
+        mov_b rax, [rbx];
+
+        cmp rax, 0x69;                          // 'i' (install)
+        je dispatch_try_install;
+        cmp rax, 0x72;                          // 'r' (remove)
+        je dispatch_try_remove;
+        cmp rax, 0x6C;                          // 'l' (list)
+        je dispatch_try_list;
+        cmp rax, 0x76;                          // 'v' (verify)
+        je dispatch_try_verify;
+        cmp rax, 0x6B;                          // 'k' (keys)
+        je dispatch_try_keys;
+        jmp dispatch_unknown;
+
+      // ---- install: n s t a l l NUL ----
+      dispatch_try_install:
+        xor rax, rax; mov_b rax, [rbx + 1]; cmp rax, 0x6E; jne dispatch_unknown;  // 'n'
+        xor rax, rax; mov_b rax, [rbx + 2]; cmp rax, 0x73; jne dispatch_unknown;  // 's'
+        xor rax, rax; mov_b rax, [rbx + 3]; cmp rax, 0x74; jne dispatch_unknown;  // 't'
+        xor rax, rax; mov_b rax, [rbx + 4]; cmp rax, 0x61; jne dispatch_unknown;  // 'a'
+        xor rax, rax; mov_b rax, [rbx + 5]; cmp rax, 0x6C; jne dispatch_unknown;  // 'l'
+        xor rax, rax; mov_b rax, [rbx + 6]; cmp rax, 0x6C; jne dispatch_unknown;  // 'l'
+        xor rax, rax; mov_b rax, [rbx + 7]; cmp rax, 0;    jne dispatch_unknown;  // NUL
+
+        mov rax, 1;
+        lea r11, [rip + chosen_subcommand];
+        mov [r11], rax;
+
+        call PkgSubcommandsM1::pkg_install_stub;
+        pop rbx;
+        ret
+
+      // ---- remove: e m o v e NUL ----
+      dispatch_try_remove:
+        xor rax, rax; mov_b rax, [rbx + 1]; cmp rax, 0x65; jne dispatch_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rbx + 2]; cmp rax, 0x6D; jne dispatch_unknown;  // 'm'
+        xor rax, rax; mov_b rax, [rbx + 3]; cmp rax, 0x6F; jne dispatch_unknown;  // 'o'
+        xor rax, rax; mov_b rax, [rbx + 4]; cmp rax, 0x76; jne dispatch_unknown;  // 'v'
+        xor rax, rax; mov_b rax, [rbx + 5]; cmp rax, 0x65; jne dispatch_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rbx + 6]; cmp rax, 0;    jne dispatch_unknown;  // NUL
+
+        mov rax, 2;
+        lea r11, [rip + chosen_subcommand];
+        mov [r11], rax;
+
+        call PkgSubcommandsM1::pkg_remove_stub;
+        pop rbx;
+        ret
+
+      // ---- list: i s t NUL ----
+      dispatch_try_list:
+        xor rax, rax; mov_b rax, [rbx + 1]; cmp rax, 0x69; jne dispatch_unknown;  // 'i'
+        xor rax, rax; mov_b rax, [rbx + 2]; cmp rax, 0x73; jne dispatch_unknown;  // 's'
+        xor rax, rax; mov_b rax, [rbx + 3]; cmp rax, 0x74; jne dispatch_unknown;  // 't'
+        xor rax, rax; mov_b rax, [rbx + 4]; cmp rax, 0;    jne dispatch_unknown;  // NUL
+
+        mov rax, 3;
+        lea r11, [rip + chosen_subcommand];
+        mov [r11], rax;
+
+        call PkgList::pkg_list_body;
+        pop rbx;
+        ret
+
+      // ---- verify: e r i f y NUL ----
+      dispatch_try_verify:
+        xor rax, rax; mov_b rax, [rbx + 1]; cmp rax, 0x65; jne dispatch_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rbx + 2]; cmp rax, 0x72; jne dispatch_unknown;  // 'r'
+        xor rax, rax; mov_b rax, [rbx + 3]; cmp rax, 0x69; jne dispatch_unknown;  // 'i'
+        xor rax, rax; mov_b rax, [rbx + 4]; cmp rax, 0x66; jne dispatch_unknown;  // 'f'
+        xor rax, rax; mov_b rax, [rbx + 5]; cmp rax, 0x79; jne dispatch_unknown;  // 'y'
+        xor rax, rax; mov_b rax, [rbx + 6]; cmp rax, 0;    jne dispatch_unknown;  // NUL
+
+        mov rax, 4;
+        lea r11, [rip + chosen_subcommand];
+        mov [r11], rax;
+
+        call PkgSubcommandsM1::pkg_verify_stub;
+        pop rbx;
+        ret
+
+      // ---- keys: e y s NUL ----
+      dispatch_try_keys:
+        xor rax, rax; mov_b rax, [rbx + 1]; cmp rax, 0x65; jne dispatch_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rbx + 2]; cmp rax, 0x79; jne dispatch_unknown;  // 'y'
+        xor rax, rax; mov_b rax, [rbx + 3]; cmp rax, 0x73; jne dispatch_unknown;  // 's'
+        xor rax, rax; mov_b rax, [rbx + 4]; cmp rax, 0;    jne dispatch_unknown;  // NUL
+
+        mov rax, 5;
+        lea r11, [rip + chosen_subcommand];
+        mov [r11], rax;
+
+        call PkgSubcommandsM1::pkg_keys_stub;
+        pop rbx;
+        ret
+
+      // ---- unknown: print diagnostic with the raw name, return 2 ----
+      // Message shape: "pkg: unknown subcommand '<name>'\n"
+      //
+      // The caller-supplied name is not NUL-length-tracked here; we
+      // walk it once to find the NUL so print_err can be given a
+      // length. Byte load pattern is the same as elsewhere. The name
+      // length is stored in rax across the two print_err calls (rbx
+      // stays as name_ptr — it was preserved by the prologue).
+      dispatch_unknown:
+        mov rax, 0xFF;
+        lea r11, [rip + chosen_subcommand];
+        mov [r11], rax;
+
+        // Print prefix.
+        lea rdi, [rip + UNK_PREFIX];
+        mov rsi, 25;                            // UNK_PREFIX_LEN
+        call Print::print_err;
+
+        // Compute name length by walking to NUL.
+        // rdx = name walk cursor; length ends up in rdx (offset from rbx).
+        mov rdx, rbx;
+
+      dispatch_unknown_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je dispatch_unknown_walk_done;
+        add rdx, 1;
+        jmp dispatch_unknown_walk;
+
+      dispatch_unknown_walk_done:
+        // Print name bytes: rdi = rbx (name_ptr), rsi = (rdx - rbx).
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call Print::print_err;
+
+        // Print suffix.
+        lea rdi, [rip + UNK_SUFFIX];
+        mov rsi, 2;                             // UNK_SUFFIX_LEN
+        call Print::print_err;
+
+        pop rbx;
+        mov rax, 2;                             // EXIT_USAGE
+        ret
+      }
+    }
+}

@@ -1,0 +1,191 @@
+// src/list.pdx — pkg.M1-002
+// PkgList module: `pkg list` body.
+//
+// Scope
+// -----
+// M1's first-runnable shape: `pkg list` walks the full dispatch chain
+// (argv parse → subcommand recognize → this body → print → exit) and
+// produces a header + a placeholder line on stdout.
+//
+// Why a placeholder rather than a live walk of /system/packages/:
+//   KIND_PDXFS_FILE at the R48-close substrate exposes six query ops
+//   (query_inode, query_len, query_mode, query_birth, query_mtime,
+//   query_refs — src/kernel/core/cap/kind_pdxfs_file.pdx L94-100 in
+//   paideia-os at commit 411ad0e) and no readdir op. The M1 substrate
+//   cannot enumerate a directory. M2 either lands a readdir extension
+//   on KIND_PDXFS_FILE or reads /system/packages/index.pdxlist (a text
+//   file the pkg_install body maintains). That choice is a §5.1 M2
+//   concern in design/tooling/r49-r50-plan.md, not an M1 one.
+//
+// M1's placeholder proves the print chain is wired end-to-end. When M2
+// upgrades the enumerator, only pkg_list_enumerate changes — the
+// header and the print-per-name loop stay.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module PkgList (PascalCase basename).
+//   - No test mnemonic; enumerate_count zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF.
+//   - r11 is scratch (used in lea for the two .rodata strings).
+//   - Function body issues nested calls to Print::print_str (2 pushes
+//     of callee-save regs would be required if we crossed a call with
+//     live state; the M1 body keeps state in .bss instead).
+
+module PkgList = structure {
+
+  // -- M1 output strings -------------------------------------------------
+  // Header printed first. The trailing NUL is not emitted (len bounds
+  // the sys_write payload); it is present so the .rodata blob is a
+  // valid C-string for potential future strlen-style consumers.
+  pub let LIST_HEADER : [u8; 20]     = "installed packages:\n"
+  pub let LIST_HEADER_LEN : u64      = 20
+
+  // M1 placeholder line. Kept obvious and dev-facing — a user reading
+  // this in stdout during M1 gets an immediate handle on why the list
+  // is empty and where in the roadmap the real enumerator lives.
+  pub let LIST_PLACEHOLDER : [u8; 62] =
+    "  (none — pkg list wires to /system/packages/ readdir at M2)\n"
+  pub let LIST_PLACEHOLDER_LEN : u64 = 62
+
+  // -- M1 enumeration state (stub) --------------------------------------
+  // pkg_list_enumerate populates enumerated_count with the number of
+  // installed packages. At M1 the enumerator is a stub that leaves the
+  // count at zero (see the M2 note above); the body still calls it so
+  // the M2 upgrade is a body edit inside pkg_list_enumerate rather
+  // than a change to pkg_list_body.
+  pub let mut enumerated_count : u64 = uninit @align(8)
+
+  // ============================================================================
+  // list_reset()
+  //
+  // Signature: list_reset : () -> () !{mem} @{}
+  //
+  // Clear enumerated_count so a subsequent pkg_list_body call starts
+  // from a known-zero baseline. Kept as a distinct entry point so
+  // pkg_main can invoke it at the top of dispatch without knowing the
+  // module's internal .bss layout.
+  //
+  // Leaf function; r11 scratch; no callee-save touched.
+  // ============================================================================
+  pub let list_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M1-002 list_reset. Zero the enumerated_count .bss slot so pkg_list_body starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf function; r11 is scratch used only for the lea; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + enumerated_count];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pkg_list_enumerate() -> count
+  //
+  // Signature: pkg_list_enumerate : () -> u64 !{mem} @{}
+  // RAX (output): number of installed packages discovered
+  //
+  // M1 body: STUB. Always returns 0. The enumerated_count slot is
+  // populated so pkg_list_body's loop skip is data-driven rather than
+  // return-value-driven — this matches the M2 shape where the
+  // enumerator writes name pointers into a .bss table and returns the
+  // count.
+  //
+  // M2 body: opens the KIND_PDXFS_FILE cap for /system/packages/ from
+  // the InitCap sidecar, enumerates children via readdir (once
+  // paideia-os exposes it) OR opens /system/packages/index.pdxlist
+  // and parses line-by-line, writes each name pointer into a .bss
+  // name table, and returns the count.
+  //
+  // Leaf function; r11 scratch; no callee-save touched.
+  // ============================================================================
+  pub let pkg_list_enumerate : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M1-002 pkg_list_enumerate STUB. Always returns 0 and writes 0 into enumerated_count. The write is redundant with list_reset (which pkg_main calls before this) but is present so a caller that skips list_reset still gets a known-zero baseline. M2 replaces the body with a live enumeration via KIND_PDXFS_FILE (paideia-os 0x195 substrate) — the signature stays u64 (count), the caller in pkg_list_body stays unchanged.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + enumerated_count];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pkg_list_body() -> exit_code
+  //
+  // Signature: pkg_list_body : () -> u64 !{mem, sysreg} @{}
+  // RAX (output): 0 on success (M1 always returns 0)
+  //
+  // M1 flow:
+  //   1. Print the header "installed packages:\n" via Print::print_str
+  //      (paideia-os sys_write to fd 1).
+  //   2. Call pkg_list_enumerate → count. At M1 this is always 0.
+  //   3. If count == 0, print the M1 placeholder line and exit 0.
+  //   4. If count > 0 (M2+ path), fall through to the print-per-name
+  //      loop. At M1 this branch is dead code; kept so the M2 patch
+  //      is a body edit inside pkg_list_enumerate rather than a
+  //      restructure of pkg_list_body.
+  //
+  // Prologue: 1 push (rbx). rsp % 16 was 8 on entry (SysV call), one
+  // push brings it to 0 which satisfies the alignment invariant for
+  // the two nested calls (Print::print_str, pkg_list_enumerate).
+  // rbx holds the loop counter across print_str calls.
+  //
+  // Register plan:
+  //   rbx = M2 loop counter (unused at M1 but preserved for the
+  //          count>0 branch that lands then)
+  //   rax = syscall/return value scratch
+  //   rdi, rsi = print_str arguments
+  //   r11 = lea scratch
+  // ============================================================================
+  pub let pkg_list_body : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M1-002 pkg_list_body. Header + count-driven placeholder. Prologue: push rbx (1 push, rsp%16 goes 8→0 which is the alignment nested calls need). rbx unused at M1 but preserved for M2's count>0 branch. Order: reset enumeration state, print header, enumerate (stub returns 0 at M1), cmp count,0 → placeholder branch. sysreg effect declared because every call into Print::print_str syscalls. All immediates are within cmp reg,imm ≤ 0x7FFFFFFF. Epilogue: pop rbx (restores rsp%16 to 8 for the ret), xor rax,rax for exit code 0, ret.",
+      block: {
+        // Prologue: preserve rbx (M2 loop counter). rsp%16: 8 → 0.
+        push rbx;
+
+        // Reset enumeration state up-front so a caller that runs
+        // pkg_list_body twice in one process (shell subshell case)
+        // sees a fresh count each time. Free-standing call, no args.
+        call PkgList::list_reset;
+
+        // Print the header. rdi = &LIST_HEADER, rsi = LIST_HEADER_LEN.
+        lea rdi, [rip + LIST_HEADER];
+        mov rsi, 20;                           // LIST_HEADER_LEN
+        call Print::print_str;
+
+        // Enumerate installed packages. Returns count in rax and also
+        // populates enumerated_count. M1: stub always returns 0.
+        call PkgList::pkg_list_enumerate;
+
+        // Branch on count. cmp rax, 0 → jne to the M2 print-loop
+        // entry (dead code at M1). Fall-through prints the placeholder.
+        cmp rax, 0;
+        jne pkg_list_body_names_loop_head;
+
+        // Zero-installed placeholder.
+        lea rdi, [rip + LIST_PLACEHOLDER];
+        mov rsi, 62;                           // LIST_PLACEHOLDER_LEN
+        call Print::print_str;
+
+        jmp pkg_list_body_done_ok;
+
+      pkg_list_body_names_loop_head:
+        // M2 entry. At M1 this label is reachable only if
+        // pkg_list_enumerate returns non-zero, which the stub never
+        // does. Deliberately empty at M1 — a fall-through to
+        // pkg_list_body_done_ok — so the M2 patch adds the loop body
+        // without moving any existing instruction.
+        jmp pkg_list_body_done_ok;
+
+      pkg_list_body_done_ok:
+        // Epilogue: rbx restore + exit-code 0.
+        pop rbx;
+        xor rax, rax;
+        ret
+      }
+    }
+}
