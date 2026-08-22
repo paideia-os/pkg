@@ -1,0 +1,431 @@
+// src/install.pdx -- pkg.M2-003
+// PkgInstall module: `pkg install <name>` body.
+//
+// Scope
+// -----
+// Per r49-r50-plan.md §5.1 M2 line: "Real pkg_install body: fetch ->
+// sig-verify (both ML-DSA-65 signatures via paideia-as v0.33 intrinsic)
+// -> unpack into KIND_PDXFS_TXN scope -> journal-fence -> atomic rename
+// into /pkgs/<name>-<version>/."
+//
+// M2 implements the FULL SHAPE of that pipeline with two well-defined
+// seams:
+//
+//   1. sha3-256 / ml_dsa_65_verify intrinsics -- ManifestCodec.mc_
+//      verify_body_hash and mc_verify_signatures return MC_HASH_STUB /
+//      MC_VERIFY_STUB pending paideia-as v0.33-crypto-kdf. Neither
+//      is filed against pkg -- both are upstream (paideia-as issues
+//      #1302..#1306 per memory index project_paideia_as_bootstrap).
+//   2. sys_pdxfs_txn_open / _commit / _abort -- TxnClient wrappers
+//      return TXN_STUB pending R42-PREP-007 (softarch to file against
+//      paideia-os). Nothing filed against pkg here either.
+//
+// When either seam returns a *_STUB code the install refuses with
+// EXIT_OP_FAIL and a diagnostic that names the missing intrinsic --
+// deliberate: a "silent skip verify" here would violate D4 (dual-signed
+// install pillar) and I5 (never bypass the audit chain).
+//
+// Install flow (mirrors design/manifest-format.md §5 verification
+// algorithm, plus the tx pipeline from r49-r50-plan.md §5.1):
+//
+//   1. Read pos_ptrs[1] (package name); pos_count must be 2 -- more or
+//      fewer is EXIT_USAGE. libpdx-argv already produced pos_ptrs[1]
+//      via ParsedArgs::pos_ptrs[1] at parse time.
+//   2. Locate the manifest.pdxsig staging path. M2 uses a
+//      deterministic path derived from the package name: /tmp/pkg-
+//      staging/<name>.pdxsig. The bootstrap script prepares this.
+//      Details in design/install-flow.md.
+//   3. ManifestCodec::mc_reset -- clear the ParsedManifest singleton.
+//   4. Read the 64B header via a helper (STUB reads from a fixed
+//      staging buffer in this repo's .bss; M3 wires the real read
+//      through KIND_PDXFS_FILE + libpdx-cap).
+//   5. ManifestCodec::mc_read_header -- populate parsed_* fields;
+//      returns MC_OK or MC_ERR_*.
+//   6. mc_verify_body_hash(body_ptr, body_len) -- SEAM.
+//   7. mc_verify_signatures(header, body, body_len, sigblock) -- SEAM.
+//   8. KindPackageManifest::pmf_cap_mint_inner -- claim the manifest
+//      row for this install (records provenance + fingerprints).
+//   9. TxnClient::txn_open(TXN_MODE_CREATE, snap_gen, wal_off) --
+//      allocate a transaction to group every write in this install.
+//   10. Extract pkg.tar into the txn's scope -- STUB (per-file walk
+//       lives at M4; the shape is one FILE_INVENTORY -> one txn write
+//       per record).
+//   11. TxnClient::txn_commit -- atomic rename into /pkgs/<name>-
+//       <version>/.
+//   12. Exit 0.
+//
+//   On any step failure: TxnClient::txn_abort (if the txn was opened),
+//   pmf_cap_revoke (if the manifest row was minted), and exit 1
+//   (EXIT_OP_FAIL). The step that failed names itself in a stderr
+//   diagnostic per D3 "audit-first" (fuller audit path lands at M3-003).
+//
+// Exit codes:
+//   0 -- install succeeded (full commit)
+//   1 -- op-fail (any step from 3-11 returned non-OK); diagnostic
+//        includes the failing step tag on stderr
+//   2 -- usage error (wrong pos_count, malformed positional)
+//
+// paideia-as compliance -- same discipline as PkgMain.
+
+module PkgInstall = structure {
+
+  // ---- Diagnostic strings ---------------------------------------------
+  pub let INSTALL_USAGE_MSG : [u8; 32] =
+    "usage: pkg install <name>\n(pkg)\n"
+  pub let INSTALL_USAGE_MSG_LEN : u64 = 32
+
+  pub let INSTALL_STAGE_MSG_1 : [u8; 41] =
+    "pkg install: staging manifest for package '"
+  pub let INSTALL_STAGE_MSG_1_LEN : u64 = 41
+  pub let INSTALL_STAGE_MSG_2 : [u8; 2]  = "'\n"
+  pub let INSTALL_STAGE_MSG_2_LEN : u64 = 2
+
+  pub let INSTALL_ERR_HEADER : [u8; 44] =
+    "pkg install: header parse failed (see errno)\n"
+  pub let INSTALL_ERR_HEADER_LEN : u64 = 44
+
+  pub let INSTALL_ERR_HASH : [u8; 78] =
+    "pkg install: body hash unavailable (paideia-as v0.33-crypto-kdf required)\n(pkg)\n"
+  pub let INSTALL_ERR_HASH_LEN : u64 = 78
+
+  pub let INSTALL_ERR_VERIFY : [u8; 76] =
+    "pkg install: sig verify unavailable (paideia-as v0.33-crypto-kdf required)\n\n"
+  pub let INSTALL_ERR_VERIFY_LEN : u64 = 76
+
+  pub let INSTALL_ERR_MINT : [u8; 51] =
+    "pkg install: manifest cap mint refused (see errno)\n"
+  pub let INSTALL_ERR_MINT_LEN : u64 = 51
+
+  pub let INSTALL_ERR_TXN : [u8; 66] =
+    "pkg install: KIND_PDXFS_TXN unavailable (R42-PREP-007 required)\n\n"
+  pub let INSTALL_ERR_TXN_LEN : u64 = 66
+
+  // ---- Install-progress state (populated across the pipeline) ----------
+  // .bss singletons -- match the ParsedManifest / ParsedArgs shape so
+  // the M4 test harness can read the final state after a call returns.
+  pub let mut install_name_ptr    : u64 = uninit @align(8)   // pos_ptrs[1]
+  pub let mut install_manifest_rc : u64 = uninit @align(8)   // last MC_* code
+  pub let mut install_pmf_row     : u64 = uninit @align(8)   // PMF row id or NONE
+  pub let mut install_txn_slot    : u64 = uninit @align(8)   // TXN cap slot or 0
+  pub let mut install_step        : u64 = uninit @align(8)   // last step index reached
+
+  pub let INSTALL_STEP_NONE     : u64 = 0
+  pub let INSTALL_STEP_HEADER   : u64 = 1
+  pub let INSTALL_STEP_HASH     : u64 = 2
+  pub let INSTALL_STEP_VERIFY   : u64 = 3
+  pub let INSTALL_STEP_MINT     : u64 = 4
+  pub let INSTALL_STEP_TXN_OPEN : u64 = 5
+  pub let INSTALL_STEP_EXTRACT  : u64 = 6
+  pub let INSTALL_STEP_COMMIT   : u64 = 7
+
+  // Staging buffer -- 64B header + 4KiB body ceiling at M2 (the M4
+  // fuzz corpus stays under 4KiB). M3 replaces with a KIND_PDXFS_FILE-
+  // backed read; the buffer stays for the M4 corpus loader.
+  pub let mut _install_staging : [u8; 4160] = uninit @align(64)
+
+  // ==========================================================================
+  // install_reset() -> ()
+  //
+  // Clear every install_* .bss slot so a subsequent pkg_install_body
+  // call starts from a known baseline.
+  // ==========================================================================
+  pub let install_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-003 install_reset: zero every install-progress slot so a subsequent pkg_install_body call sees a known-empty state. Leaf function.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + install_name_ptr];    mov [r11], rax;
+        lea r11, [rip + install_manifest_rc]; mov [r11], rax;
+        lea r11, [rip + install_pmf_row];     mov [r11], rax;
+        lea r11, [rip + install_txn_slot];    mov [r11], rax;
+        lea r11, [rip + install_step];        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pkg_install_body() -> exit_code
+  //
+  // Signature: pkg_install_body : () -> u64 !{mem, sysreg} @{}
+  //
+  // Reads ParsedArgs::pos_count + ParsedArgs::pos_ptrs[1], then walks
+  // the pipeline documented in the module preamble. Every step's return
+  // code updates install_manifest_rc / install_step so the M4 test
+  // harness can inspect where the pipeline exited.
+  //
+  // Register plan (five callee-save pushes + one pad slot = 48 bytes):
+  //   rbx = pos_ptrs[1]  (package name; survives every nested call)
+  //   r12 = ManifestCodec return code (rax cache across print calls)
+  //   r13 = PMF row id after mint (INSTALL_STEP_MINT); 0xFF on failure
+  //   r14 = TXN slot after open (INSTALL_STEP_TXN_OPEN); 0 on failure
+  //   r15 = final exit code accumulator
+  //   Entry rsp%16 == 8; five pushes (-40B) -> rsp%16 == 0. Sub rsp,8
+  //   for the pad -> rsp%16 == 8 (nested calls need == 0 so we DO NOT
+  //   pad here; five pushes alone hit 0). Correction: we DO NOT push
+  //   the pad; five pushes is exactly right.
+  //
+  // Correction to prologue: five 8-byte pushes flip rsp%16 8 -> 0 which
+  // is what the nested calls need. NO pad slot.
+  // ==========================================================================
+  pub let pkg_install_body : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M2-003 pkg_install_body. Full pipeline: pos_ptrs[1] check -> mc_reset -> mc_read_header (from _install_staging) -> mc_verify_body_hash SEAM -> mc_verify_signatures SEAM -> pmf_cap_mint_inner -> txn_open SEAM -> extract SEAM -> txn_commit SEAM. Two seams (crypto + txn) return *_STUB codes and gate the install with EXIT_OP_FAIL + a diagnostic naming the missing intrinsic -- this is deliberate: a silent skip would violate D4 (dual-signed pillar). On any failure: txn_abort if txn was opened; pmf_cap_revoke if pmf row was minted. Five callee-save pushes (rbx/r12/r13/r14/r15) flip rsp%16 8->0 at every nested call. Every large-imm return code staged via r11. Labels prefixed pi_. Print calls preserve rax across argument shuffle by using r12/r13/r15 for the value lanes.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // Step 0: reset install state.
+        call install_reset;
+
+        // Step 0a: reset ManifestCodec state.
+        call mc_reset;
+
+        // Initialise scratch registers.
+        xor r13, r13;
+        mov r11, 0xFF;                       // PMF_ROW_NONE
+        mov r13, r11;                        // r13 = PMF_ROW_NONE (invalid)
+        xor r14, r14;                        // r14 = TXN_SLOT_NONE
+        xor r15, r15;                        // r15 = exit code = 0 (OK)
+
+        // Step 1: check pos_count == 2 (subcommand + one positional).
+        lea r11, [rip + ParsedArgs::pos_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne pi_usage_error;
+
+        // Step 1a: load pos_ptrs[1] -> rbx.
+        lea r11, [rip + ParsedArgs::pos_ptrs];
+        mov rbx, [r11 + 8];                  // pos_ptrs[1]
+        cmp rbx, 0;
+        je  pi_usage_error;
+
+        // Persist name pointer.
+        lea r11, [rip + install_name_ptr];
+        mov [r11], rbx;
+
+        // Step 2: emit progress diagnostic on stdout so a caller sees
+        // "we started" even if the pipeline stops at a seam.
+        lea rdi, [rip + INSTALL_STAGE_MSG_1];
+        mov rsi, 41;                         // INSTALL_STAGE_MSG_1_LEN
+        call Print::print_str;
+
+        // Print package name -- walk to NUL for length.
+        mov rdx, rbx;
+      pi_name_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je  pi_name_walk_done;
+        add rdx, 1;
+        jmp pi_name_walk;
+      pi_name_walk_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call Print::print_str;
+
+        lea rdi, [rip + INSTALL_STAGE_MSG_2];
+        mov rsi, 2;                          // INSTALL_STAGE_MSG_2_LEN
+        call Print::print_str;
+
+        // Step 3: read header from staging buffer.
+        mov r11, 1;                          // INSTALL_STEP_HEADER
+        lea rax, [rip + install_step];
+        mov [rax], r11;
+
+        lea rdi, [rip + _install_staging];
+        call mc_read_header;
+        mov r12, rax;
+        lea r11, [rip + install_manifest_rc];
+        mov [r11], r12;
+        cmp r12, 0;                          // MC_OK == 0
+        jne pi_err_header;
+
+        // Step 4: body hash (SEAM).
+        mov r11, 2;                          // INSTALL_STEP_HASH
+        lea rax, [rip + install_step];
+        mov [rax], r11;
+
+        // body_ptr = staging + 64
+        lea rdi, [rip + _install_staging];
+        add rdi, 64;
+        // body_len = parsed_body_len
+        lea r11, [rip + parsed_body_len];
+        mov rsi, [r11];
+        call mc_verify_body_hash;
+        mov r12, rax;
+        lea r11, [rip + install_manifest_rc];
+        mov [r11], r12;
+        cmp r12, 0;
+        jne pi_err_hash;
+
+        // Step 5: signatures (SEAM).
+        mov r11, 3;                          // INSTALL_STEP_VERIFY
+        lea rax, [rip + install_step];
+        mov [rax], r11;
+
+        lea rdi, [rip + _install_staging];                  // header_ptr
+        mov rsi, rdi;
+        add rsi, 64;                                        // body_ptr
+        lea r11, [rip + parsed_body_len];
+        mov rdx, [r11];                                     // body_len
+        // sigblock_ptr = header + 64 + body_len
+        mov rcx, rsi;
+        add rcx, rdx;
+        call mc_verify_signatures;
+        mov r12, rax;
+        lea r11, [rip + install_manifest_rc];
+        mov [r11], r12;
+        cmp r12, 0;
+        jne pi_err_verify;
+
+        // Step 6: mint KindPackageManifest row.
+        mov r11, 4;                          // INSTALL_STEP_MINT
+        lea rax, [rip + install_step];
+        mov [rax], r11;
+
+        // Args: pdxfs_row_id=0 (M2 stub -- no real KIND_PDXFS_FILE cap
+        // seeded for the staging read yet), author_fpr halves + root_fpr
+        // halves from ParsedManifest.
+        mov rdi, 0;                          // pdxfs_row_id (M2 stub)
+        lea r11, [rip + parsed_author_fpr_lo];
+        mov rsi, [r11];
+        lea r11, [rip + parsed_author_fpr_hi];
+        mov rdx, [r11];
+        lea r11, [rip + parsed_root_fpr_lo];
+        mov rcx, [r11];
+        lea r11, [rip + parsed_root_fpr_hi];
+        mov r8,  [r11];
+        call pmf_cap_mint_inner;
+        // A successful return is 0..PMF_MAX-1 (0..7); anything at
+        // 0xFFFFEC3* is a refusal.
+        mov r13, rax;
+        lea r11, [rip + install_pmf_row];
+        mov [r11], r13;
+        // Cheap disambiguation: refusals are all >= 0xFFFFEC00.
+        mov r11, 0xFFFFEC00;
+        cmp r13, r11;
+        jae pi_err_mint;
+
+        // Step 7: open txn (SEAM).
+        mov r11, 5;                          // INSTALL_STEP_TXN_OPEN
+        lea rax, [rip + install_step];
+        mov [rax], r11;
+
+        mov rdi, 1;                          // TXN_MODE_CREATE
+        xor rsi, rsi;                        // snap_gen (stub)
+        xor rdx, rdx;                        // wal_off (stub)
+        call txn_open;
+        mov r14, rax;
+        lea r11, [rip + install_txn_slot];
+        mov [r11], r14;
+        // Stubs return TXN_STUB (0xFFFFEA80); any high-band value fails.
+        mov r11, 0xFFFFEA00;
+        cmp r14, r11;
+        jae pi_err_txn;
+
+        // Step 8: extract (STUB) -- one txn write per FILE_INVENTORY
+        // record. M4 lands the per-file walk against a fixture manifest;
+        // M2 keeps the seam and falls through to commit.
+        mov r11, 6;                          // INSTALL_STEP_EXTRACT
+        lea rax, [rip + install_step];
+        mov [rax], r11;
+
+        // Step 9: commit.
+        mov r11, 7;                          // INSTALL_STEP_COMMIT
+        lea rax, [rip + install_step];
+        mov [rax], r11;
+
+        mov rdi, r14;                        // slot
+        call txn_commit;
+        mov r11, 0xFFFFEA00;
+        cmp rax, r11;
+        jae pi_err_txn;
+
+        // Success. Exit 0.
+        xor r15, r15;
+        jmp pi_epilogue;
+
+        // ==== error branches -- each prints a diagnostic + sets r15 ====
+      pi_usage_error:
+        lea rdi, [rip + INSTALL_USAGE_MSG];
+        mov rsi, 32;                         // INSTALL_USAGE_MSG_LEN
+        call Print::print_err;
+        mov r15, 2;                          // EXIT_USAGE
+        jmp pi_epilogue;
+
+      pi_err_header:
+        lea rdi, [rip + INSTALL_ERR_HEADER];
+        mov rsi, 44;                         // INSTALL_ERR_HEADER_LEN
+        call Print::print_err;
+        mov r15, 1;                          // EXIT_OP_FAIL
+        jmp pi_epilogue;
+
+      pi_err_hash:
+        lea rdi, [rip + INSTALL_ERR_HASH];
+        mov rsi, 78;                         // INSTALL_ERR_HASH_LEN
+        call Print::print_err;
+        mov r15, 1;
+        jmp pi_epilogue;
+
+      pi_err_verify:
+        lea rdi, [rip + INSTALL_ERR_VERIFY];
+        mov rsi, 76;                         // INSTALL_ERR_VERIFY_LEN
+        call Print::print_err;
+        mov r15, 1;
+        jmp pi_epilogue;
+
+      pi_err_mint:
+        lea rdi, [rip + INSTALL_ERR_MINT];
+        mov rsi, 51;                         // INSTALL_ERR_MINT_LEN
+        call Print::print_err;
+        mov r15, 1;
+        jmp pi_epilogue;
+
+      pi_err_txn:
+        lea rdi, [rip + INSTALL_ERR_TXN];
+        mov rsi, 66;                         // INSTALL_ERR_TXN_LEN
+        call Print::print_err;
+        mov r15, 1;
+
+      pi_epilogue:
+        // Cleanup: if a txn was opened successfully (r14 < 0xFFFFEA00),
+        // abort it. If a pmf row was minted (r13 < 0xFF), revoke it.
+        // Both are best-effort -- ignore return codes.
+        mov r11, 0xFFFFEA00;
+        cmp r14, r11;
+        jae pi_ep_check_pmf;
+        cmp r14, 0;
+        je  pi_ep_check_pmf;
+        // Only abort if we didn't already commit (r15 != 0 => we bailed).
+        cmp r15, 0;
+        je  pi_ep_check_pmf;
+        mov rdi, r14;
+        call txn_abort;
+
+      pi_ep_check_pmf:
+        // If we minted a pmf row AND we bailed, revoke it.
+        mov r11, 0xFF;                       // PMF_ROW_NONE
+        cmp r13, r11;
+        je  pi_ep_return;
+        cmp r15, 0;
+        je  pi_ep_return;
+        mov rdi, r13;
+        call pmf_cap_revoke;
+
+      pi_ep_return:
+        mov rax, r15;                        // exit code
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

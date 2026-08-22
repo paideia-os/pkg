@@ -27,6 +27,9 @@ sources:
   - src/print.pdx                 # sys_write(fd=1) helper
   - src/kind_package_manifest.pdx # KIND_PACKAGE_MANIFEST = 0x193 (M2-001)
   - src/kind_package_repo.pdx     # KIND_PACKAGE_REPO     = 0x192 (M2-002)
+  - src/manifest_codec.pdx        # manifest.pdxsig decoder + verify seams (M2-003)
+  - src/txn_client.pdx            # KIND_PDXFS_TXN userspace wrappers (M2-003)
+  - src/install.pdx               # `pkg install <name>` body (M2-003)
   - src/subcommands_m1_stubs.pdx  # install / remove / verify / keys stubs
   - src/list.pdx                  # `pkg list` body (M1: header + placeholder)
   - src/dispatch.pdx              # subcommand recognizer + routing

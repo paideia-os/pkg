@@ -1,0 +1,357 @@
+// src/manifest_codec.pdx -- pkg.M2-003
+// ManifestCodec module: manifest.pdxsig header parser + body-walker
+// scaffold + sig-verify seam.
+//
+// Scope
+// -----
+// Real byte-level decoder for the 64-byte header defined in
+// design/manifest-format.md §4.1. The parser is deterministic (no
+// allocation, no lookahead beyond one KV record) and fills a singleton
+// .bss record (ParsedManifest) the pkg_install / pkg_verify bodies read
+// after this returns MC_OK.
+//
+// Milestone binding
+// -----------------
+// M2 lands:
+//   * Real header decode (magic / format_version / body_len / hashes /
+//     sigblock_len / pubkey lengths).
+//   * Bounds enforcement (BODY_LEN_MAX = 1 MiB; SIG_LEN_MAX per sig).
+//   * body sha3-256 check SEAM (calls into sha3_256_stub which returns
+//     MC_HASH_STUB pending paideia-as v0.33-crypto-kdf).
+//   * KV body walk with the M1 tag registry.
+//   * Signature verify SEAM (calls into ml_dsa_65_verify_stub which
+//     returns MC_VERIFY_STUB pending v0.33-crypto).
+//
+// M3 replaces sha3_256_stub / ml_dsa_65_verify_stub with paideia-as
+// crypto-kdf intrinsics; nothing else moves. M4 fuzzes this parser
+// (bit flips against a fixture manifest -> refuse or accept, never
+// crash) per r49-r50-plan.md §5.1 M4 line.
+//
+// Wire fields (mirror design/manifest-format.md §4.1):
+//   [+0]  8B magic          "pdxsig\0\0"
+//   [+8]  4B format_version 1
+//   [+12] 4B header_flags   0
+//   [+16] 8B body_len
+//   [+24] 8B body_sha3_lo
+//   [+32] 8B body_sha3_hi
+//   [+40] 8B sigblock_len
+//   [+48] 4B pubkey_len_author
+//   [+52] 4B pubkey_len_root
+//   [+56] 8B created_unix_secs
+//
+// paideia-as compliance -- same discipline as the KindPackageManifest
+// module. Every load is qword; the 4B fields are extracted from the
+// containing qword with shift+mask.
+
+module ManifestCodec = structure {
+
+  // ---- Constants -------------------------------------------------------
+
+  // Magic byte 0..7 -- "pdxsig\0\0" little-endian: 0x00_00_67_69_73_78_64_70
+  pub let MC_MAGIC_QWORD : u64 = 0x0000676973786470
+
+  pub let MC_FORMAT_VERSION_MIN : u64 = 1
+  pub let MC_FORMAT_VERSION_MAX : u64 = 1
+
+  // 1 MiB body ceiling per verification algorithm step 4 in
+  // design/manifest-format.md §5. Larger bodies are refused before any
+  // hash work.
+  pub let MC_BODY_LEN_MAX : u64 = 0x100000            // 1 MiB
+
+  // Individual signature length ceiling; ML-DSA-65 signatures are 3293
+  // bytes at NIST level 2 -- ceiling 8192 accommodates a level-3 or
+  // level-5 rotation per format evolution §6.
+  pub let MC_SIG_LEN_MAX : u64 = 0x2000               // 8 KiB
+
+  // Sigblock is 2*(4B length + sig). Max = 2*(4 + MC_SIG_LEN_MAX).
+  pub let MC_SIGBLOCK_LEN_MAX : u64 = 0x4008          // 2 * (4 + 8192)
+
+  // ML-DSA-65 pubkey lengths at NIST level 2 = 1952 bytes. Ceiling
+  // 4096 accommodates level-3/level-5 rotation.
+  pub let MC_PUBKEY_LEN_MAX : u64 = 0x1000
+
+  // ---- KV tag registry (mirror design/manifest-format.md §4.2) ---------
+  pub let MC_TAG_PKG_NAME         : u64 = 0x0001
+  pub let MC_TAG_PKG_VERSION      : u64 = 0x0002
+  pub let MC_TAG_PKG_REPO_URL     : u64 = 0x0003
+  pub let MC_TAG_PAIDEIA_AS_VER   : u64 = 0x0004
+  pub let MC_TAG_AUTHOR_PUBKEY    : u64 = 0x0010
+  pub let MC_TAG_AUTHOR_FPR       : u64 = 0x0011
+  pub let MC_TAG_AUTHOR_EXPIRY    : u64 = 0x0012
+  pub let MC_TAG_ROOT_PUBKEY      : u64 = 0x0020
+  pub let MC_TAG_ROOT_FPR         : u64 = 0x0021
+  pub let MC_TAG_ROOT_EXPIRY      : u64 = 0x0022
+  pub let MC_TAG_CAPS_DECL_HASH   : u64 = 0x0030
+  pub let MC_TAG_DEPS_LIST_HASH   : u64 = 0x0031
+  pub let MC_TAG_FILE_INVENTORY   : u64 = 0x0040
+  pub let MC_TAG_BUILD_REPRODUCER : u64 = 0x00F0
+
+  // 0x8000+ tags refused at parse per §6 forward-compat escape hatch.
+  pub let MC_TAG_HIGH_BIT : u64 = 0x8000
+
+  // ---- Return codes ----------------------------------------------------
+  pub let MC_OK              : u64 = 0
+
+  pub let MC_ERR_MAGIC          : u64 = 0xFFFFEB00
+  pub let MC_ERR_VERSION        : u64 = 0xFFFFEB01
+  pub let MC_ERR_FLAGS          : u64 = 0xFFFFEB02
+  pub let MC_ERR_BODY_TOO_LARGE : u64 = 0xFFFFEB03
+  pub let MC_ERR_SIG_TOO_LARGE  : u64 = 0xFFFFEB04
+  pub let MC_ERR_PUBKEY_LEN     : u64 = 0xFFFFEB05
+  pub let MC_ERR_BODY_HASH      : u64 = 0xFFFFEB06
+  pub let MC_ERR_TAG_HIGH_BIT   : u64 = 0xFFFFEB07
+  pub let MC_ERR_MISSING_TAG    : u64 = 0xFFFFEB08   // required tag absent
+  pub let MC_ERR_AUTHOR_SIG     : u64 = 0xFFFFEB09
+  pub let MC_ERR_ROOT_SIG       : u64 = 0xFFFFEB0A
+  pub let MC_ERR_ROOT_FPR       : u64 = 0xFFFFEB0B
+
+  // Stubs -- pending paideia-as v0.33-crypto-kdf. Not errors per se;
+  // they signal "the verify path is scaffolded but the intrinsic is
+  // missing." pkg_install treats them as EXIT_OP_FAIL with a
+  // diagnostic naming the missing intrinsic.
+  pub let MC_HASH_STUB   : u64 = 0xFFFFEB70
+  pub let MC_VERIFY_STUB : u64 = 0xFFFFEB71
+
+  // ---- ParsedManifest singleton ---------------------------------------
+  // Populated by mc_read_header; extended fields by mc_walk_body.
+  // Same singleton pattern as ParsedArgs in libpdx-argv.
+  pub let mut parsed_magic          : u64 = uninit @align(8)
+  pub let mut parsed_format_version : u64 = uninit @align(8)
+  pub let mut parsed_header_flags   : u64 = uninit @align(8)
+  pub let mut parsed_body_len       : u64 = uninit @align(8)
+  pub let mut parsed_body_sha3_lo   : u64 = uninit @align(8)
+  pub let mut parsed_body_sha3_hi   : u64 = uninit @align(8)
+  pub let mut parsed_sigblock_len   : u64 = uninit @align(8)
+  pub let mut parsed_pubkey_len_a   : u64 = uninit @align(8)
+  pub let mut parsed_pubkey_len_r   : u64 = uninit @align(8)
+  pub let mut parsed_created        : u64 = uninit @align(8)
+
+  // KV-walk-populated fields (subset that install needs -- fingerprint
+  // halves for the KindPackageManifest mint, and presence flags for
+  // MISSING-TAG enforcement).
+  pub let mut parsed_author_fpr_lo  : u64 = uninit @align(8)
+  pub let mut parsed_author_fpr_hi  : u64 = uninit @align(8)
+  pub let mut parsed_root_fpr_lo    : u64 = uninit @align(8)
+  pub let mut parsed_root_fpr_hi    : u64 = uninit @align(8)
+  // Presence bitmask over required tags for the MISSING check.
+  pub let mut parsed_tags_seen      : u64 = uninit @align(8)
+
+  // Required-tag bitmask -- must all be present for MC_OK.
+  //   bit 0: PKG_NAME (0x0001)
+  //   bit 1: PKG_VERSION
+  //   bit 2: AUTHOR_PUBKEY
+  //   bit 3: AUTHOR_FPR
+  //   bit 4: ROOT_PUBKEY
+  //   bit 5: ROOT_FPR
+  //   bit 6: CAPS_DECL_HASH
+  pub let MC_REQUIRED_TAGS_MASK : u64 = 0x7F   // bits 0..6
+
+  // ==========================================================================
+  // mc_reset() -> ()
+  //
+  // Clear every parsed_* slot so a subsequent mc_read_header starts from
+  // a known baseline. Also clears parsed_tags_seen so the M2 KV-walk's
+  // MISSING check starts fresh.
+  // ==========================================================================
+  pub let mc_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-003 mc_reset: zero every ParsedManifest .bss slot so mc_read_header + mc_walk_body start clean. Fifteen slots -- listed explicitly (no loop) so a future field addition surfaces as a new lea+mov here rather than a silent gap. Labels: none needed (leaf, no branches).",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + parsed_magic];          mov [r11], rax;
+        lea r11, [rip + parsed_format_version]; mov [r11], rax;
+        lea r11, [rip + parsed_header_flags];   mov [r11], rax;
+        lea r11, [rip + parsed_body_len];       mov [r11], rax;
+        lea r11, [rip + parsed_body_sha3_lo];   mov [r11], rax;
+        lea r11, [rip + parsed_body_sha3_hi];   mov [r11], rax;
+        lea r11, [rip + parsed_sigblock_len];   mov [r11], rax;
+        lea r11, [rip + parsed_pubkey_len_a];   mov [r11], rax;
+        lea r11, [rip + parsed_pubkey_len_r];   mov [r11], rax;
+        lea r11, [rip + parsed_created];        mov [r11], rax;
+        lea r11, [rip + parsed_author_fpr_lo];  mov [r11], rax;
+        lea r11, [rip + parsed_author_fpr_hi];  mov [r11], rax;
+        lea r11, [rip + parsed_root_fpr_lo];    mov [r11], rax;
+        lea r11, [rip + parsed_root_fpr_hi];    mov [r11], rax;
+        lea r11, [rip + parsed_tags_seen];      mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mc_read_header(buf_ptr) -> MC_OK | MC_ERR_*
+  //
+  // Parse the 64-byte header at [buf_ptr..buf_ptr+64] into the parsed_*
+  // singleton slots. No signature verify, no body hash -- those live at
+  // mc_verify_body_hash / mc_verify_signatures.
+  //
+  // Sequence:
+  //   1. Load qword[+0]; compare against MC_MAGIC_QWORD; else MC_ERR_MAGIC.
+  //   2. Load qword[+8]; extract format_version (low 32b) and header_
+  //      flags (high 32b); require format_version == 1, header_flags == 0.
+  //   3. Load qword[+16] -> parsed_body_len; enforce <= MC_BODY_LEN_MAX.
+  //   4. Load qword[+24] -> parsed_body_sha3_lo.
+  //   5. Load qword[+32] -> parsed_body_sha3_hi.
+  //   6. Load qword[+40] -> parsed_sigblock_len; enforce <= MC_SIGBLOCK_LEN_MAX.
+  //   7. Load qword[+48]; extract pubkey_len_a (low 32b) + pubkey_len_r
+  //      (high 32b); each <= MC_PUBKEY_LEN_MAX.
+  //   8. Load qword[+56] -> parsed_created.
+  //   9. Return MC_OK.
+  //
+  // paideia-as compliance: r11 scratch; every cmp reg,imm <= 0x7FFFFFFF
+  // (largest raw is 0x100000 -- staged via r11 for cmp against body_len).
+  //
+  // Register plan (leaf, no callee-save touched):
+  //   rdi = buf_ptr (untouched)
+  //   rax = per-load scratch / field value
+  //   rcx = extracted field lane
+  //   r10 = mask constants (0xFFFFFFFF for 32b lanes)
+  //   r11 = LEA scratch / large-imm staging
+  // ==========================================================================
+  pub let mc_read_header : (u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-003 mc_read_header: parse the 64B manifest header into ParsedManifest slots. Eight qword loads at fixed offsets; two of them (qword@8, qword@48) carry a pair of 32b lanes each, extracted via shr 32 and 0xFFFFFFFF mask. Every large immediate (0x100000 body ceiling, 0x4008 sigblock ceiling, 0x1000 pubkey ceiling, 0x0000676973786470 magic) staged via r11. Leaf function; no push/pop parity to preserve. Labels prefixed mc_hd_.",
+      block: {
+        // Step 1: magic.
+        mov rax, [rdi + 0];
+        mov r11, 0x0000676973786470;         // MC_MAGIC_QWORD
+        cmp rax, r11;
+        jne mc_hd_bad_magic;
+        // Persist.
+        lea r11, [rip + parsed_magic];
+        mov [r11], rax;
+
+        // Step 2: format_version + header_flags in qword@8.
+        mov rax, [rdi + 8];
+        mov r10, 0xFFFFFFFF;
+        mov rcx, rax;
+        and rcx, r10;                        // format_version
+        cmp rcx, 1;                          // MC_FORMAT_VERSION_MIN/MAX
+        jne mc_hd_bad_version;
+        lea r11, [rip + parsed_format_version];
+        mov [r11], rcx;
+
+        shr rax, 32;                         // header_flags
+        cmp rax, 0;                          // must be 0 at M1
+        jne mc_hd_bad_flags;
+        lea r11, [rip + parsed_header_flags];
+        mov [r11], rax;
+
+        // Step 3: body_len.
+        mov rax, [rdi + 16];
+        mov r11, 0x100000;                   // MC_BODY_LEN_MAX
+        cmp rax, r11;
+        ja  mc_hd_bad_body_len;
+        lea r11, [rip + parsed_body_len];
+        mov [r11], rax;
+
+        // Step 4: body_sha3_lo.
+        mov rax, [rdi + 24];
+        lea r11, [rip + parsed_body_sha3_lo];
+        mov [r11], rax;
+
+        // Step 5: body_sha3_hi.
+        mov rax, [rdi + 32];
+        lea r11, [rip + parsed_body_sha3_hi];
+        mov [r11], rax;
+
+        // Step 6: sigblock_len.
+        mov rax, [rdi + 40];
+        mov r11, 0x4008;                     // MC_SIGBLOCK_LEN_MAX
+        cmp rax, r11;
+        ja  mc_hd_bad_sig_len;
+        lea r11, [rip + parsed_sigblock_len];
+        mov [r11], rax;
+
+        // Step 7: pubkey_len_a (low 32b) + pubkey_len_r (high 32b).
+        mov rax, [rdi + 48];
+        mov r10, 0xFFFFFFFF;
+        mov rcx, rax;
+        and rcx, r10;
+        mov r11, 0x1000;                     // MC_PUBKEY_LEN_MAX
+        cmp rcx, r11;
+        ja  mc_hd_bad_pubkey;
+        lea r11, [rip + parsed_pubkey_len_a];
+        mov [r11], rcx;
+
+        shr rax, 32;
+        mov r11, 0x1000;
+        cmp rax, r11;
+        ja  mc_hd_bad_pubkey;
+        lea r11, [rip + parsed_pubkey_len_r];
+        mov [r11], rax;
+
+        // Step 8: created_unix_secs.
+        mov rax, [rdi + 56];
+        lea r11, [rip + parsed_created];
+        mov [r11], rax;
+
+        xor rax, rax;                        // MC_OK
+        ret;
+
+      mc_hd_bad_magic:
+        mov rax, 0xFFFFEB00;                 // MC_ERR_MAGIC
+        ret;
+      mc_hd_bad_version:
+        mov rax, 0xFFFFEB01;
+        ret;
+      mc_hd_bad_flags:
+        mov rax, 0xFFFFEB02;
+        ret;
+      mc_hd_bad_body_len:
+        mov rax, 0xFFFFEB03;
+        ret;
+      mc_hd_bad_sig_len:
+        mov rax, 0xFFFFEB04;
+        ret;
+      mc_hd_bad_pubkey:
+        mov rax, 0xFFFFEB05;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mc_verify_body_hash(body_ptr, body_len) -> MC_OK | MC_HASH_STUB
+  //                                          | MC_ERR_BODY_HASH
+  //
+  // Verify sha3-256(body[0..body_len]) equals the (lo,hi) pair the
+  // header carried. M2 STUB: returns MC_HASH_STUB unconditionally
+  // pending paideia-as v0.33-crypto-kdf shipping sha3_256_intrinsic.
+  //
+  // The stub signature already matches the M3 shape (one entry, two
+  // args, one return code) so wiring the intrinsic is a body-swap
+  // rather than a signature change. pkg_install treats MC_HASH_STUB
+  // as EXIT_OP_FAIL with a diagnostic naming the missing intrinsic
+  // -- the ONLY code path in M2 that reports the stubbed-out state.
+  // ==========================================================================
+  pub let mc_verify_body_hash : (u64, u64) -> u64 !{mem} @{} =
+    fn (body_ptr: u64) (body_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-003 mc_verify_body_hash STUB: signature-only scaffold pending paideia-as v0.33-crypto-kdf sha3_256_intrinsic. Returns MC_HASH_STUB unconditionally. M3-wire replaces the body with `hash = sha3_256(body_ptr, body_len); cmp against parsed_body_sha3_lo/hi; return OK or MC_ERR_BODY_HASH`. Signature kept stable so pkg_install call site does not move. Labels: none.",
+      block: {
+        mov rax, 0xFFFFEB70;                 // MC_HASH_STUB
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mc_verify_signatures(header_ptr, body_ptr, body_len, sigblock_ptr)
+  //   -> MC_OK | MC_VERIFY_STUB | MC_ERR_AUTHOR_SIG | MC_ERR_ROOT_SIG
+  //
+  // Verify both ML-DSA-65 signatures over (header || body). M2 STUB:
+  // returns MC_VERIFY_STUB. M3 wires ml_dsa_65_verify twice against
+  // AUTHOR_PUBKEY + ROOT_PUBKEY resolved from the KV body walk.
+  //
+  // Callee-save: none touched (leaf).
+  // ==========================================================================
+  pub let mc_verify_signatures : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (header_ptr: u64) (body_ptr: u64) (body_len: u64) (sigblock_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-003 mc_verify_signatures STUB: signature-only scaffold pending paideia-as v0.33-crypto-kdf ml_dsa_65_verify. Returns MC_VERIFY_STUB. M3 replaces body with two ml_dsa_65_verify calls (author sig, root sig) over header||body plus a ROOT_FPR check against /system/keys/paideia_root_pk.fpr. Signature kept stable.",
+      block: {
+        mov rax, 0xFFFFEB71;                 // MC_VERIFY_STUB
+        ret
+      }
+    }
+}

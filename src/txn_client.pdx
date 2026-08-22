@@ -1,0 +1,191 @@
+// src/txn_client.pdx -- pkg.M2-003
+// TxnClient module: userspace-side wrapper for KIND_PDXFS_TXN
+// (paideia-os KindPdxfsTxn = 0x196) via the sys_cap_invoke syscall
+// (paideia-os syscall id 4).
+//
+// Scope
+// -----
+// pkg_install groups every write into `/pkgs/<name>-<version>/` under
+// ONE KIND_PDXFS_TXN so a partial install rolls back cleanly. This
+// module wraps the syscall boundary so pkg_install reads as a linear
+// sequence of intent (`txn_open` -> `txn_stage_write` * N -> `txn_commit`
+// or `txn_abort`) rather than an open-coded syscall chain.
+//
+// The kernel dispatcher entry point for cap_invoke sits at paideia-os
+// src/kernel/core/syscall/dispatch.pdx L664-667:
+//
+//   dispatch_cap_invoke:
+//     mov rdi, rsi;   // slot     <- user rsi
+//     mov rsi, rdx;   // op_arg   <- user rdx
+//     call cap_invoke;
+//     ret;
+//
+// The user-side calling convention that reaches this dispatcher is:
+//   syscall #4, slot in rsi, op_arg in rdx.
+//
+// This is documented in the syscall register plan section of every
+// wrapper below.
+//
+// Milestone binding
+// -----------------
+// M2 lands the wrappers with SEAM bodies -- txn_open / txn_commit /
+// txn_abort issue the intended syscall shape but each body currently
+// returns TXN_STUB. This is deliberate: the paideia-os cap_invoke
+// dispatch for KIND_PDXFS_TXN at HEAD (kind_pdxfs_txn.pdx line 772)
+// only exposes read-side QUERY ops -- there is no COMMIT / ABORT op
+// yet, and no BEGIN-open path since minting is kernel-internal. When
+// the R42 tooling substrate lands the write-side ops (a "R42-PREP-007"
+// scope softarch would file against paideia-os), the wrapper bodies
+// flip from "return STUB" to "make the syscall + translate the return."
+//
+// The M2 shape lets pkg_install exercise the full call graph without
+// its call sites depending on when the write ops land; the M2 install
+// exit code names the missing substrate.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module TxnClient (PascalCase basename).
+//   - No `test` mnemonic.
+//   - Every cmp reg,imm <= 0x7FFFFFFF (large-imm return codes staged
+//     via r11).
+//   - r11 scratch.
+//   - Leaf functions; no callee-save touched.
+
+module TxnClient = structure {
+
+  // ---- Return codes ---------------------------------------------------
+  pub let TXN_OK       : u64 = 0
+  pub let TXN_STUB     : u64 = 0xFFFFEA80   // M2 seam: substrate op missing
+  pub let TXN_BAD_ROW  : u64 = 0xFFFFEA81
+  pub let TXN_BAD_ARG  : u64 = 0xFFFFEA82
+  pub let TXN_KERNEL   : u64 = 0xFFFFEA83   // cap_invoke returned a fault
+
+  // ---- Op codes -- mirror kind_pdxfs_txn.pdx PXT_OP_* -----------------
+  // Read-side (existing at paideia-os HEAD):
+  pub let TXN_OP_QUERY_ID    : u64 = 0
+  pub let TXN_OP_QUERY_SNAP  : u64 = 1
+  pub let TXN_OP_QUERY_WAL   : u64 = 2
+  pub let TXN_OP_QUERY_BYTES : u64 = 3
+  pub let TXN_OP_QUERY_STATE : u64 = 4
+  pub let TXN_OP_QUERY_MODE  : u64 = 5
+
+  // Write-side (proposed for R42 substrate-prep-007):
+  pub let TXN_OP_COMMIT      : u64 = 7
+  pub let TXN_OP_ABORT       : u64 = 8
+
+  // ---- Syscall id -----------------------------------------------------
+  pub let SYS_CAP_INVOKE : u64 = 4
+
+  // ---- Modes (mirror KindPdxfsTxn PXT_MODE_*) -------------------------
+  pub let TXN_MODE_CREATE : u64 = 1
+  pub let TXN_MODE_MODIFY : u64 = 2
+  pub let TXN_MODE_DELETE : u64 = 3
+
+  // ==========================================================================
+  // txn_query_state(slot) -> state_byte | TXN_KERNEL
+  //
+  // Read the transaction state via cap_invoke(slot, PXT_OP_QUERY_STATE).
+  // This op EXISTS at paideia-os HEAD (kind_pdxfs_txn.pdx cap_handler_
+  // pdxfs_txn line 772+). Returns the state byte (OPEN=1 / COMMITTED=2
+  // / ABORTED=3 / EXPIRED=4) or TXN_KERNEL if cap_invoke faults.
+  //
+  // User-side syscall convention:
+  //   rdi = SYS_CAP_INVOKE (=4)   [syscall #]
+  //   rsi = slot                   [maps to dispatcher rdi]
+  //   rdx = op                     [maps to dispatcher rsi]
+  //
+  // Kernel returns in rax; INVOKE_DENIED (0xFFFFFFFFFFFFFFFD) or
+  // INVOKE_UNSUPPORTED (0xFFFFFFFFFFFFFFFC) are translated to TXN_KERNEL
+  // so callers see one vocabulary for "the kernel refused."
+  // ==========================================================================
+  pub let txn_query_state : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M2-003 txn_query_state: wraps cap_invoke(slot, PXT_OP_QUERY_STATE=4). The op exists at paideia-os HEAD so this is a REAL call, not a seam. Register shuffle: caller-ABI (rdi=slot) -> syscall-ABI (rdi=sysno=4, rsi=slot, rdx=op=4). After syscall, INVOKE_DENIED (0xFFFFFFFFFFFFFFFD) and INVOKE_UNSUPPORTED (0xFFFFFFFFFFFFFFFC) map to TXN_KERNEL; other values pass through. Both fault sentinels are large -- compared via r11 staging. sysreg effect declared per the SYSRET rcx/r11 architectural clobber. Labels prefixed tc_qs_.",
+      block: {
+        mov rsi, rdi;                        // slot into syscall arg1
+        mov rdi, 4;                          // SYS_CAP_INVOKE
+        mov rdx, 4;                          // PXT_OP_QUERY_STATE
+        syscall;
+
+        // Translate INVOKE_DENIED / INVOKE_UNSUPPORTED to TXN_KERNEL.
+        mov r11, 0xFFFFFFFFFFFFFFFD;         // INVOKE_DENIED
+        cmp rax, r11;
+        je  tc_qs_kernel;
+        mov r11, 0xFFFFFFFFFFFFFFFC;         // INVOKE_UNSUPPORTED
+        cmp rax, r11;
+        je  tc_qs_kernel;
+
+        ret;
+
+      tc_qs_kernel:
+        mov rax, 0xFFFFEA83;                 // TXN_KERNEL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // txn_open(mode, snap_gen, wal_off) -> slot | TXN_STUB
+  //
+  // Mint a new KIND_PDXFS_TXN cap and return the cap_table slot the
+  // caller should thread through subsequent txn_* calls.
+  //
+  // M2 SEAM: the paideia-os KindPdxfsTxn kernel-side minter is
+  // pdxfs_txn_cap_mint_inner but there is no user-facing SYSCALL that
+  // reaches it (mint is internal to a supervisor path in the R42
+  // roadmap). The M2 body returns TXN_STUB so pkg_install exercises
+  // the full call graph and the M4 install matrix can distinguish
+  // "unimplemented-substrate" from an install-body bug.
+  //
+  // M3+ replaces the body with the actual syscall once the paideia-os
+  // "sys_pdxfs_txn_open" handler is filed (softarch R42-PREP-007).
+  // ==========================================================================
+  pub let txn_open : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (mode: u64) (snap_gen: u64) (wal_off: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M2-003 txn_open SEAM: returns TXN_STUB pending paideia-os sys_pdxfs_txn_open syscall (R42-PREP-007). Args reserved for the M3 wire-through. Labels: none.",
+      block: {
+        mov rax, 0xFFFFEA80;                 // TXN_STUB
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // txn_commit(slot) -> TXN_OK | TXN_STUB | TXN_KERNEL
+  //
+  // Commit the transaction. On success the KIND_PDXFS_TXN row's state
+  // flips to PXT_STATE_COMMITTED and every write staged through it
+  // becomes durable atomically.
+  //
+  // M2 SEAM (see txn_open note).
+  // ==========================================================================
+  pub let txn_commit : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M2-003 txn_commit SEAM: returns TXN_STUB pending PXT_OP_COMMIT wire-through in paideia-os KindPdxfsTxn dispatch. M3 body will `mov rsi, rdi; mov rdi, 4; mov rdx, 7; syscall;` then translate INVOKE_* sentinels to TXN_KERNEL.",
+      block: {
+        mov rax, 0xFFFFEA80;                 // TXN_STUB
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // txn_abort(slot) -> TXN_OK | TXN_STUB | TXN_KERNEL
+  //
+  // Abort the transaction. Every write staged through the txn is
+  // discarded; the row's state flips to PXT_STATE_ABORTED. Called by
+  // pkg_install on any verify / extract failure so a partially-written
+  // /pkgs/<name>-<version>/ never becomes visible.
+  //
+  // M2 SEAM (see txn_open note).
+  // ==========================================================================
+  pub let txn_abort : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M2-003 txn_abort SEAM: returns TXN_STUB pending PXT_OP_ABORT wire-through. M3 body mirrors txn_commit with rdx=8.",
+      block: {
+        mov rax, 0xFFFFEA80;                 // TXN_STUB
+        ret
+      }
+    }
+}

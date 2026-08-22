@@ -19,10 +19,12 @@
 // implemented" (3) from "usage error / unknown subcommand" (2) from
 // "operation failed" (1).
 //
-// M2 lands the install and remove bodies (issues #4-#6 per the plan
-// doc §5.1 milestone breakdown). M2 lands the verify body (part of
-// #4). M5 lands the keys body (fingerprint listing off the M5
-// paideia_root_pk documentation).
+// M2 landed the install body (issue #6, PkgInstall::pkg_install_body
+// at src/install.pdx). M2 landed the remove body (issue #7, PkgRemove::
+// pkg_remove_body at src/remove.pdx). This module now hosts only the
+// verify and keys stubs (verify body lands with M2's install/remove
+// pair -- an M2 follow-up -- and keys lands at M5 with the fingerprint
+// listing off the paideia_root_pk documentation).
 //
 // paideia-as compliance
 // ---------------------
@@ -47,13 +49,10 @@ module PkgSubcommandsM1 = structure {
   // stays scannable. The M-tag makes the message self-explaining
   // (a maintainer reading logs in six months knows which milestone
   // upgrades this line to a real body).
-  pub let INSTALL_STUB_MSG : [u8; 52] =
-    "pkg install: body not implemented at M1 (lands at M2)\n"
-  pub let INSTALL_STUB_MSG_LEN : u64 = 52
-
-  pub let REMOVE_STUB_MSG : [u8; 51] =
-    "pkg remove: body not implemented at M1 (lands at M2)\n"
-  pub let REMOVE_STUB_MSG_LEN : u64 = 51
+  // INSTALL_STUB_MSG + REMOVE_STUB_MSG dropped at M2 -- their bodies
+  // now live at src/install.pdx (PkgInstall) and src/remove.pdx
+  // (PkgRemove) respectively. The verify + keys stubs stay until M2
+  // follow-up (verify) and M5 (keys).
 
   pub let VERIFY_STUB_MSG : [u8; 51] =
     "pkg verify: body not implemented at M1 (lands at M2)\n"
@@ -63,55 +62,9 @@ module PkgSubcommandsM1 = structure {
     "pkg keys: body not implemented at M1 (lands at M5)\n"
   pub let KEYS_STUB_MSG_LEN : u64 = 49
 
-  // ============================================================================
-  // pkg_install_stub() -> exit_code
-  //
-  // Signature: pkg_install_stub : () -> u64 !{mem, sysreg} @{}
-  // RAX (output): 3 (EXIT_NOT_YET_IMPLEMENTED)
-  //
-  // Body: 1 print + exit-code load. See the module preamble for the
-  // rationale on why M1 recognises this subcommand rather than
-  // rejecting it as unknown.
-  //
-  // Register plan (1-push prologue for alignment):
-  //   rbx = unused; preserved for parity with the M2 body that reuses
-  //          the same frame
-  //   rax = return value
-  //   rdi, rsi = print_str arguments
-  //   r11 = lea scratch
-  // ============================================================================
-  pub let pkg_install_stub : () -> u64 !{mem, sysreg} @{} =
-    fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {},
-      justification: "pkg.M1-002 pkg_install_stub. Prints INSTALL_STUB_MSG on stdout via Print::print_str and returns 3. 1-push prologue (rbx) aligns rsp%16 to 0 for the nested syscall. M2's pkg_install body replaces the body but keeps this signature so the dispatch call site in dispatch.pdx does not change.",
-      block: {
-        push rbx;
-        lea rdi, [rip + INSTALL_STUB_MSG];
-        mov rsi, 52;                            // INSTALL_STUB_MSG_LEN
-        call Print::print_str;
-        pop rbx;
-        mov rax, 3;                             // EXIT_NOT_YET_IMPLEMENTED
-        ret
-      }
-    }
-
-  // ============================================================================
-  // pkg_remove_stub() -> 3
-  // ============================================================================
-  pub let pkg_remove_stub : () -> u64 !{mem, sysreg} @{} =
-    fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {},
-      justification: "pkg.M1-002 pkg_remove_stub. Same shape as pkg_install_stub with REMOVE_STUB_MSG. M2's pkg_remove body replaces the body; signature stays.",
-      block: {
-        push rbx;
-        lea rdi, [rip + REMOVE_STUB_MSG];
-        mov rsi, 51;                            // REMOVE_STUB_MSG_LEN
-        call Print::print_str;
-        pop rbx;
-        mov rax, 3;
-        ret
-      }
-    }
+  // pkg_install_stub and pkg_remove_stub removed at M2 -- dispatch.pdx
+  // now routes directly to PkgInstall::pkg_install_body and
+  // PkgRemove::pkg_remove_body.
 
   // ============================================================================
   // pkg_verify_stub() -> 3

@@ -194,7 +194,7 @@ module Dispatch = structure {
         lea r11, [rip + chosen_subcommand];
         mov [r11], rax;
 
-        call PkgSubcommandsM1::pkg_install_stub;
+        call PkgInstall::pkg_install_body;
         pop rbx;
         ret
 
