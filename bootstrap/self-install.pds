@@ -1,0 +1,90 @@
+# bootstrap/self-install.pds -- pkg.M2-005
+# pkg self-install bootstrap
+#
+# Wave: R49  Milestone: M2  Issue: #8 (pkg.M2-005)
+# Spec:  design/self-install-bootstrap.md §2
+# Runtime: consumed by shell.M2-004 (.pds script executor).
+#
+# The ten-step chain that turns this repo's sources into a signed
+# /pkgs/pkg-<version>/ install. At M2 the chain deliberately halts
+# at step 8 with the "sig verify unavailable" diagnostic; the M4
+# smoke matrix asserts the halt point (install_step == 3).
+#
+# Environment variables (consumed by the .pds runtime once shell M2
+# lands; a POSIX-sh translation at bootstrap/self-install.sh takes
+# the same names for the pre-shell window):
+#
+#   PDX_BUILD_OUT      -- path to `paideia-as build` output dir
+#                         (default: /tmp/pkg-stage0-build)
+#   PDX_STAGING        -- staging dir for the pending install
+#                         (default: /tmp/pkg-staging)
+#   PDX_AUTHOR_KEY     -- path to author signing key
+#                         (default: ~/.pdx/keys/author.pk)
+#   PDX_ROOT_KEY       -- path to paideia-root signing key
+#                         (default: ~/.pdx/keys/paideia-root.pk)
+#   PDX_FIXTURE_SIG    -- optional; path to a pre-built .pdxsig
+#                         to skip step 5 (M2 default when
+#                         paideia-as v0.33-crypto-kdf is missing)
+#
+# Exit codes:
+#   0  -- self-install succeeded (M3+ real path)
+#   1  -- self-install refused at verify seam (M2 expected)
+#   2  -- self-install refused before verify (usage / build / stage)
+#   3+ -- unexpected
+
+set -e
+
+: ${PDX_BUILD_OUT:=/tmp/pkg-stage0-build}
+: ${PDX_STAGING:=/tmp/pkg-staging}
+: ${PDX_AUTHOR_KEY:=$HOME/.pdx/keys/author.pk}
+: ${PDX_ROOT_KEY:=$HOME/.pdx/keys/paideia-root.pk}
+
+mkdir -p "$PDX_BUILD_OUT"
+mkdir -p "$PDX_STAGING"
+
+# Step 1: build stage-0 pkg from this repo's sources.
+paideia-as build manifest.pdxproj -o "$PDX_BUILD_OUT/pkg-stage0"
+
+# Steps 2-3: separate the binary + caps.decl for the tar packer.
+cp "$PDX_BUILD_OUT/pkg-stage0"       "$PDX_BUILD_OUT/pkg-stage0.bin"
+cp caps.decl                          "$PDX_BUILD_OUT/pkg-stage0.caps"
+
+# Step 4: pack into a tar.
+tar cf "$PDX_BUILD_OUT/pkg-stage0.tar" \
+    -C "$PDX_BUILD_OUT" pkg-stage0.bin pkg-stage0.caps
+
+# Step 5: sign with author + root keys.
+#   At M2 the paideia-as v0.33-crypto-kdf sign path is not yet in
+#   the toolchain; PDX_FIXTURE_SIG lets the M4 harness bypass step 5
+#   and drop a pre-baked fixture .pdxsig into staging.
+if [ -n "$PDX_FIXTURE_SIG" ] && [ -f "$PDX_FIXTURE_SIG" ]; then
+    cp "$PDX_FIXTURE_SIG" "$PDX_BUILD_OUT/pkg-stage0.pdxsig"
+else
+    paideia-as sign \
+        --author-key "$PDX_AUTHOR_KEY" \
+        --root-key   "$PDX_ROOT_KEY" \
+        "$PDX_BUILD_OUT/pkg-stage0.tar" \
+        -o           "$PDX_BUILD_OUT/pkg-stage0.pdxsig"
+fi
+
+# Steps 6-7: stage the manifest + tar where PkgInstall reads them.
+cp "$PDX_BUILD_OUT/pkg-stage0.pdxsig"  "$PDX_STAGING/pkg.pdxsig"
+cp "$PDX_BUILD_OUT/pkg-stage0.tar"     "$PDX_STAGING/pkg.tar"
+
+# Step 8: self-install.
+#   At M2 this reaches ManifestCodec::mc_verify_signatures SEAM and
+#   exits 1 with the "sig verify unavailable" diagnostic. That is the
+#   intended M2 halt point per design/self-install-bootstrap.md §3.
+#   The M4 smoke matrix asserts install_step == 3 (INSTALL_STEP_VERIFY).
+"$PDX_BUILD_OUT/pkg-stage0" install pkg
+INSTALL_RC=$?
+
+# Steps 9-10: M3+ only -- fingerprint verify + stage-0 cleanup.
+# Kept as comments so the shape is visible.
+#
+# if [ "$INSTALL_RC" = "0" ]; then
+#     verify_fingerprints /bin/pkg "$PDX_BUILD_OUT/pkg-stage0"
+#     rm "$PDX_BUILD_OUT/pkg-stage0" "$PDX_BUILD_OUT/pkg-stage0.tar"
+# fi
+
+exit $INSTALL_RC
