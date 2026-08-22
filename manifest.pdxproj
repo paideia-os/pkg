@@ -1,6 +1,6 @@
 # pkg — paideia-as build manifest
 #
-# Wave: R49  Milestone: M1 (design + skeleton)
+# Wave: R49  Milestone: M4 (tests + smoke)
 # Doc:   design/tooling/r49-r50-plan.md §5.1 in the paideia-os repo.
 #
 # Consumed by `paideia-as build`. Each line is a directive; blank lines
@@ -15,7 +15,7 @@
 # build-out/pkg.caps for the InitCap sidecar packaging step at M5.
 
 name        = pkg
-version     = 0.3.0-m3
+version     = 0.4.0-m4
 kind        = tool
 entry       = PkgMain::pkg_main
 output      = build-out/pkg

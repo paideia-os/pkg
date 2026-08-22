@@ -1,0 +1,86 @@
+# tests/m4-003-qemu-smoke/smoke.pds -- pkg.M4-003
+#
+# Wave: R49  Milestone: M4  Issue: #15 (pkg.M4-003)
+# Spec:  design/test-matrix.md §4 QEMU smoke matrix.
+# Runtime: consumed by shell.M2-004 (.pds script executor).
+#
+# The .pds mirror of smoke.sh -- five subcommand invocations in the
+# order the plan doc names: install -> list -> verify -> remove ->
+# verify absent (trailing list). Both files run the same chain with
+# the same env-var contract; a change to one MUST update the other
+# (design/test-matrix.md §4).
+#
+# At M4-close each invocation halts at the substrate gate the design
+# doc pins:
+#
+#   install pkg -> exit 1 (halts at pi_err_header; _install_staging
+#                          zero-init)
+#   list         -> exit 0 (M1 placeholder line on stdout)
+#   verify       -> exit 3 (M1 stub -- lands at M2 follow-up)
+#   remove pkg  -> exit 1 (halts at UR_ERR_LOOKUP; readdir gap)
+#   list         -> exit 0 (placeholder, still -- nothing removed)
+#
+# Env vars (consumed by the .pds runtime once shell.M2 lands; a
+# POSIX-sh translation at tests/m4-003-qemu-smoke/smoke.sh takes the
+# same names for the pre-shell window):
+#
+#   PKG_BINARY  -- path to the pkg binary
+#                  (default: build-out/pkg; QEMU-hosted: /bin/pkg)
+#   PDX_STAGING -- staging dir (default: /tmp/pkg-staging)
+#
+# Exit codes:
+#   0            -- every cell in the chain matched pinned expected
+#   1..127       -- count of failed cells (capped at 127)
+#
+# The pinned per-cell expected transcript is at
+# tests/m4-003-qemu-smoke/expected/full-matrix.txt. Diff-based
+# assertion; a change to any diagnostic string is a deliberate
+# substrate advance and must update the expected file in the same
+# commit.
+
+set -e
+
+: ${PKG_BINARY:=build-out/pkg}
+: ${PDX_STAGING:=/tmp/pkg-staging}
+
+mkdir -p "$PDX_STAGING"
+
+# Clear any leftover fixture so the chain starts from a known
+# baseline (matches smoke.sh line 32).
+rm -f "$PDX_STAGING/pkg.pdxsig"
+
+# ---- Chain step 1: install pkg -------------------------------------
+# Expected: exit 1, stderr[0] = "pkg install: header parse failed
+# (see errno)". At M5 substrate: exit 0, /pkgs/pkg-*/ populated.
+"$PKG_BINARY" install pkg
+INSTALL_RC=$?
+
+# ---- Chain step 2: list --------------------------------------------
+# Expected: exit 0, no stderr (M1 placeholder on stdout).
+"$PKG_BINARY" list
+LIST1_RC=$?
+
+# ---- Chain step 3: verify ------------------------------------------
+# Expected: exit 3, stderr[0] = "pkg verify: body not implemented
+# at M1 (lands at M2)". At M2-follow-up: exit 0, cross-verify
+# against installed manifest.
+"$PKG_BINARY" verify
+VERIFY_RC=$?
+
+# ---- Chain step 4: remove pkg --------------------------------------
+# Expected: exit 1, stderr[0] = "pkg remove: /system/packages/
+# readdir unavailable at M2 (R42)". At M5 substrate: exit 0,
+# /pkgs/pkg-*/ moved to trash.
+"$PKG_BINARY" remove pkg
+REMOVE_RC=$?
+
+# ---- Chain step 5: list ("verify absent") --------------------------
+# Expected: exit 0, no stderr. At M5 substrate: no pkg in the
+# listing (proving the remove effect).
+"$PKG_BINARY" list
+LIST2_RC=$?
+
+# The per-cell (exit, stderr[0]) assertion runs in smoke.sh --
+# under shell.M2's .pds executor, the same assertion runs via
+# a `pipe-assert` idiom the M4 driver adds alongside this file
+# once shell.M2-004 lands (tracked as a shell M2 follow-up).

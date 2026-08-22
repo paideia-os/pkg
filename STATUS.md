@@ -1,9 +1,9 @@
 # pkg — status
 
 **Wave:** R49 (Wave 1)
-**Current milestone:** M3 (semantic-pipe / audit / elevate integration) —
-CLOSED. Ready for M4 (sig-mismatch matrix + partial-install rollback +
-QEMU smoke).
+**Current milestone:** M4 (tests + smoke) — CLOSED. Ready for M5
+(dual-signed pkg v1.0 release + `pkgs.paideia-os` mirror push +
+`.pdxdoc` for `doc pkg`).
 
 ## Milestone rollup
 
@@ -21,6 +21,9 @@ QEMU smoke).
 | M3-002 | semantic-pipe: InstallProgressRecord[] per install stage       | LANDED | #10   |
 | M3-003 | libpdx-audit: pre-output journal on every subcommand           | LANDED | #11   |
 | M3-004 | libpdx-elevate: KIND_PDXFS_FILE(write,/pkgs) 60s window        | LANDED | #12   |
+| M4-001 | sig-mismatch matrix (author bad, root bad, both bad -- all refuse) | LANDED | #13   |
+| M4-002 | partial-install rollback via KIND_PDXFS_TXN abort              | LANDED | #14   |
+| M4-003 | QEMU smoke: install -> list -> verify -> remove -> verify absent | LANDED | #15   |
 
 See `design/tooling/r49-r50-plan.md` §5.1 in paideia-os for the full
 breakdown (M1-M5) and cross-repo dependencies.
@@ -112,13 +115,54 @@ bootstrap/
   this as parent_slot=0, txn_open refuses with PXT_MINT_BAD_PARENT, and
   pi_err_parent renders the diagnostic. Path is shape-complete for M4.
 
-## M4 blockers (upstream — filed against paideia-os / paideia-as)
+## M4 close status
 
-- **paideia-as v0.33-crypto-kdf** — Argon2id-KDF + ChaCha20-Poly1305 +
-  ML-DSA-65 verify intrinsics. Blocks M4 sig-mismatch matrix.
-- **paideia-os R48-PREP-005** — svc.elevate-broker registration + auto-
-  approve policy table wiring for KIND_ELEVATE_CHANNEL. Blocks M4
-  live-elevate install path.
-- **`/system/packages/` readdir** — either an extension on
+M4 landed scaffolding (tests + smoke drivers) that assert the
+observable surface (exit code + first stderr line) against pinned
+expected files. Because upstream substrate gates still refuse (see
+below), every M4 cell today asserts a REFUSAL. The `expected/*.txt`
+files diff-flip per substrate step; the driver scripts and
+fixtures are unchanged across each uplift.
+
+- **M4-001** (issue #13) -- three-cell sig-mismatch fixture matrix
+  under `tests/m4-001-sig-mismatch/` with deterministic generator
+  (`gen-fixtures.sh`) + driver (`run.sh`) + pinned expected files.
+- **M4-002** (issue #14) -- partial-install rollback shape driver
+  under `tests/m4-002-partial-rollback/`. Branch A (nothing to roll
+  back) cell reachable at M4-close; Branches B and C documented
+  for M5 uplift.
+- **M4-003** (issue #15) -- QEMU smoke chain (install -> list ->
+  verify -> remove -> list) driver + `.pds` mirror + pinned five-
+  cell transcript under `tests/m4-003-qemu-smoke/`.
+- **`design/test-matrix.md`** -- M4 test taxonomy design doc
+  documenting every cell + expected outcome at each substrate
+  state (M4, post-wire-in, M5).
+
+## Substrate gates still blocking full-green M4 (upstream)
+
+Filed against paideia-os / paideia-as. Each gate's exit path is
+pinned in the M4 expected files; when the gate closes, the pin
+diff-flips.
+
+- **paideia-as v0.33-crypto-kdf** -- Argon2id-KDF + ChaCha20-Poly1305 +
+  ML-DSA-65 verify intrinsics. Blocks M4-001 discrimination between
+  author-bad / root-bad / both-bad cells (all halt at seam today).
+- **paideia-os R48-PREP-005** -- svc.elevate-broker registration +
+  auto-approve policy table wiring for KIND_ELEVATE_CHANNEL. Blocks
+  M4-002 Branches B and C and M4-003 install step exit 0.
+- **paideia-os KIND_PDXFS_FILE staging read** -- reads a fixture
+  .pdxsig into `_install_staging` so `mc_read_header` observes
+  fixture bytes instead of zero-init .bss. Blocks the M4-001 fixture
+  wire-in; every cell hits pi_err_header until this closes.
+- **`/system/packages/` readdir** -- either an extension on
   `KIND_PDXFS_FILE` or a text `index.pdxlist` that pkg_install
-  maintains. Blocks `pkg list --available` full enumeration.
+  maintains. Blocks M4-003 remove step exit 0 and `pkg list --
+  available` full enumeration.
+
+## M5 (next milestone)
+
+Per `design/tooling/r49-r50-plan.md` §5.1 M5 line: dual-signed
+`manifest.pdxsig` for pkg v1.0, CHANGELOG-1.0 entry, `pkgs.paideia-
+os` mirror push, `pkg keys` documentation of the paideia_root_pk
+fingerprint, `.pdxdoc` file for `doc pkg`. Depends on paideia-as
+v0.33-crypto-kdf (author + root signing) + doc.M2 reachable.

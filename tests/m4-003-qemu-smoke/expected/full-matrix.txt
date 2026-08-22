@@ -1,0 +1,40 @@
+# M4-003 QEMU smoke matrix -- pinned per-cell (exit, stderr[0])
+#
+# Wave: R49  Milestone: M4  Issue: #15
+# Spec:  design/test-matrix.md §4.
+#
+# One block per subcommand in the chain, separated by "---". The
+# smoke.sh driver iterates blocks in order and asserts each cell's
+# (exit, stderr[0]) against the pkg-invocation at the corresponding
+# position in the CHAIN_ARGS sequence:
+#
+#   1. install pkg  <-> block 1 (cell=install)
+#   2. list          <-> block 2 (cell=list-before)
+#   3. verify        <-> block 3 (cell=verify)
+#   4. remove pkg   <-> block 4 (cell=remove)
+#   5. list          <-> block 5 (cell=list-after)
+#
+# Format per block:
+#   cell=<name>
+#   exit=<int>
+#   stderr[0]=<line>          -- empty for cells that print nothing on stderr
+
+cell=install
+exit=1
+stderr[0]=pkg install: header parse failed (see errno)
+---
+cell=list-before
+exit=0
+stderr[0]=
+---
+cell=verify
+exit=3
+stderr[0]=pkg verify: body not implemented at M1 (lands at M2)
+---
+cell=remove
+exit=1
+stderr[0]=pkg remove: /system/packages/ readdir unavailable at M2 (R42)
+---
+cell=list-after
+exit=0
+stderr[0]=
