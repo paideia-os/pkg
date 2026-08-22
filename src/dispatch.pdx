@@ -196,7 +196,7 @@ module Dispatch = structure {
 
         call pkg_install_body;
         pop rbx;
-        ret
+        ret;
 
       // ---- remove: e m o v e NUL ----
       dispatch_try_remove:
@@ -213,7 +213,7 @@ module Dispatch = structure {
 
         call pkg_remove_body;
         pop rbx;
-        ret
+        ret;
 
       // ---- list: i s t NUL ----
       dispatch_try_list:
@@ -228,7 +228,7 @@ module Dispatch = structure {
 
         call pkg_list_body;
         pop rbx;
-        ret
+        ret;
 
       // ---- verify: e r i f y NUL ----
       dispatch_try_verify:
@@ -245,7 +245,7 @@ module Dispatch = structure {
 
         call pkg_verify_stub;
         pop rbx;
-        ret
+        ret;
 
       // ---- keys: e y s NUL ----
       dispatch_try_keys:
@@ -260,7 +260,7 @@ module Dispatch = structure {
 
         call pkg_keys_stub;
         pop rbx;
-        ret
+        ret;
 
       // ---- unknown: print diagnostic with the raw name, return 2 ----
       // Message shape: "pkg: unknown subcommand '<name>'\n"
