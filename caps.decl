@@ -60,3 +60,4 @@ requires:
 # KeyFingerprintRecord[] on pkg keys list.
 declares_output_schemas:
   - PackageManifest        # pdxsig.pkg.pmf.v1 -- emitted by `pkg list` (M3-001)
+  - InstallProgressRecord  # pdxsig.pkg.ipr.v1 -- emitted per stage by `pkg install` (M3-002)

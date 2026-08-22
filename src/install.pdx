@@ -217,7 +217,7 @@ module PkgInstall = structure {
   pub let pkg_install_body : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "pkg.M3-003 pkg_install_body. M3 upgrade over M2: audit-first (I5) -- AuditWire::audit_begin_op fires BEFORE any output emission or state mutation. On broker unavailable, refuse with AUDIT_EXIT_BROKER_FAIL (3) without emitting any output. On success, audit_id lives in _install_audit_id .bss so the epilogue can commit it without depending on register pressure. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient's own contract. Full pipeline (unchanged shape): pos_ptrs[1] check -> mc_reset -> mc_read_header -> mc_verify_body_hash SEAM -> mc_verify_signatures SEAM -> pmf_cap_mint_inner -> txn_open (real syscall #70) -> extract SEAM -> txn_commit (real cap_invoke). On any failure: txn_abort if txn was opened; pmf_cap_revoke if pmf row was minted. Five callee-save pushes (rbx/r12/r13/r14/r15) flip rsp%16 8->0 at every nested call. Labels prefixed pi_.",
+      justification: "pkg.M3-002 + M3-003 pkg_install_body. M3 upgrades over M2: (a) audit-first (I5) -- AuditWire::audit_begin_op fires BEFORE any output emission or state mutation; on broker unavailable, refuse with AUDIT_EXIT_BROKER_FAIL (3) without emitting any output; audit_id lives in _install_audit_id .bss so the epilogue can commit it without depending on register pressure. (b) semantic-pipe (M3-002) -- PipeSchemas::ps_bind_install_progress fires once after audit_begin (bind is inside the audited window per I5), then ps_emit_install_progress fires after every stage (HEADER/HASH/VERIFY/MINT/TXN_OPEN/COMMIT) with the actual rc so a supervisor consuming the schema-typed side of stdout sees one record per stage; r12/r13/r14 are SysV callee-save so they survive the emit calls without extra spill; the COMMIT stage saves rax to install_manifest_rc across the emit call and reloads for the branch. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient / PipeSchemas. Full pipeline (unchanged shape): pos_ptrs[1] check -> mc_reset -> mc_read_header -> mc_verify_body_hash SEAM -> mc_verify_signatures SEAM -> pmf_cap_mint_inner -> txn_open (real syscall #70) -> extract SEAM -> txn_commit (real cap_invoke). On any failure: txn_abort if txn was opened; pmf_cap_revoke if pmf row was minted. Five callee-save pushes (rbx/r12/r13/r14/r15) flip rsp%16 8->0 at every nested call. Labels prefixed pi_.",
       block: {
         push rbx;
         push r12;
@@ -248,6 +248,14 @@ module PkgInstall = structure {
         je  pi_broker_fail;
         lea r11, [rip + _install_audit_id];
         mov [r11], rax;
+
+        // ---- M3-002: bind stdout to InstallProgressRecord schema ------
+        // Idempotent; a bind failure is non-fatal because every emit
+        // downstream also refuses on unbound fd -- the caller sees the
+        // text side of the output either way (D2 in design/tooling/plan.md).
+        // Bind fires AFTER audit_begin so the bind's syscall is inside
+        // the audited window (I5 audit-first). Return code ignored.
+        call PipeSchemas::ps_bind_install_progress;
 
         // Initialise scratch registers.
         xor r13, r13;
@@ -311,6 +319,13 @@ module PkgInstall = structure {
         mov r12, rax;
         lea r11, [rip + install_manifest_rc];
         mov [r11], r12;
+
+        // M3-002: emit InstallProgressRecord(step=HEADER, rc=r12).
+        // r12 is SysV callee-save so it survives the emit call.
+        mov rdi, 1;                          // INSTALL_STEP_HEADER
+        mov rsi, r12;
+        call PipeSchemas::ps_emit_install_progress;
+
         cmp r12, 0;                          // MC_OK == 0
         jne pi_err_header;
 
@@ -329,6 +344,12 @@ module PkgInstall = structure {
         mov r12, rax;
         lea r11, [rip + install_manifest_rc];
         mov [r11], r12;
+
+        // M3-002: emit InstallProgressRecord(step=HASH, rc=r12).
+        mov rdi, 2;                          // INSTALL_STEP_HASH
+        mov rsi, r12;
+        call PipeSchemas::ps_emit_install_progress;
+
         cmp r12, 0;
         jne pi_err_hash;
 
@@ -349,6 +370,12 @@ module PkgInstall = structure {
         mov r12, rax;
         lea r11, [rip + install_manifest_rc];
         mov [r11], r12;
+
+        // M3-002: emit InstallProgressRecord(step=VERIFY, rc=r12).
+        mov rdi, 3;                          // INSTALL_STEP_VERIFY
+        mov rsi, r12;
+        call PipeSchemas::ps_emit_install_progress;
+
         cmp r12, 0;
         jne pi_err_verify;
 
@@ -375,6 +402,15 @@ module PkgInstall = structure {
         mov r13, rax;
         lea r11, [rip + install_pmf_row];
         mov [r11], r13;
+
+        // M3-002: emit InstallProgressRecord(step=MINT, rc=r13). r13
+        // is either row_id (0..7) or refusal (0xFFFFEC3*); both shapes
+        // are informative to a supervisor scanning the record stream.
+        // r13 is SysV callee-save so it survives the emit call.
+        mov rdi, 4;                          // INSTALL_STEP_MINT
+        mov rsi, r13;
+        call PipeSchemas::ps_emit_install_progress;
+
         // Cheap disambiguation: refusals are all >= 0xFFFFEC00.
         mov r11, 0xFFFFEC00;
         cmp r13, r11;
@@ -406,6 +442,15 @@ module PkgInstall = structure {
         mov r14, rax;
         lea r11, [rip + install_txn_slot];
         mov [r11], r14;
+
+        // M3-002: emit InstallProgressRecord(step=TXN_OPEN, rc=r14).
+        // r14 is either cap_slot ([0,256)) or refusal (0xFFFFEC1x band
+        // / -ENFILE); both surface to a supervisor as the same shape.
+        // r14 is SysV callee-save so it survives the emit call.
+        mov rdi, 5;                          // INSTALL_STEP_TXN_OPEN
+        mov rsi, r14;
+        call PipeSchemas::ps_emit_install_progress;
+
         // Success: rax in [0, 256). Any rax >= 256 is a mint sentinel
         // (0xFFFFEC1x band) or -ENFILE (0xFFFFFFFFFFFFFFDF). PXT_MINT_
         // BAD_PARENT (0xFFFFEC2D) is the one we expect at M3 while
@@ -440,6 +485,21 @@ module PkgInstall = structure {
 
         mov rdi, r14;                        // slot
         call TxnClient::txn_commit;
+        // Save commit rc so the emit call (rax-clobbering) does not
+        // erase it -- install_manifest_rc is the shared rc lane every
+        // stage already writes.
+        lea r11, [rip + install_manifest_rc];
+        mov [r11], rax;
+
+        // M3-002: emit InstallProgressRecord(step=COMMIT, rc=commit_rc).
+        mov rdi, 7;                          // INSTALL_STEP_COMMIT
+        mov rsi, rax;                        // rc (moved BEFORE call)
+        call PipeSchemas::ps_emit_install_progress;
+
+        // Reload commit rc from install_manifest_rc for the branch.
+        lea r11, [rip + install_manifest_rc];
+        mov rax, [r11];
+
         // Success: rax == 0. TXN_KERNEL / PXT_BAD_TRANSITION both fail.
         cmp rax, 0;
         jne pi_err_txn;
