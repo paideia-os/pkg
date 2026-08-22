@@ -27,6 +27,7 @@ sources:
   - src/print.pdx                 # sys_write(fd=1) helper
   - src/audit_wire.pdx            # libpdx-audit wire helper (M3-003)
   - src/pipe_schemas.pdx          # libpdx-semantic-pipe schema bind/emit (M3-001/M3-002)
+  - src/pkg_elevate.pdx           # libpdx-elevate wrapper for /pkgs write (M3-004)
   - src/kind_package_manifest.pdx # KIND_PACKAGE_MANIFEST = 0x193 (M2-001)
   - src/kind_package_repo.pdx     # KIND_PACKAGE_REPO     = 0x192 (M2-002)
   - src/manifest_codec.pdx        # manifest.pdxsig decoder + verify seams (M2-003)
@@ -48,6 +49,7 @@ deps:
   - libpdx-argv @ ^0.1
   - libpdx-audit @ ^0.2           # M3-003: pre-output journal on every subcommand
   - libpdx-semantic-pipe @ ^0.2   # M3-001 + M3-002: schema-typed stdout for list + install
+  - libpdx-elevate @ ^0.2         # M3-004: KIND_PDXFS_FILE(write,/pkgs) 60s window
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49 tool observes and every M1 file

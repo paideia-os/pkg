@@ -1,8 +1,9 @@
 # pkg — status
 
 **Wave:** R49 (Wave 1)
-**Current milestone:** M2 (core implementation) — CLOSED. Ready for M3
-(semantic-pipe / audit integration + libpdx-elevate wiring).
+**Current milestone:** M3 (semantic-pipe / audit / elevate integration) —
+CLOSED. Ready for M4 (sig-mismatch matrix + partial-install rollback +
+QEMU smoke).
 
 ## Milestone rollup
 
@@ -16,6 +17,10 @@
 | M2-003 | pkg_install body: fetch → verify → txn → rename                | LANDED | #6    |
 | M2-004 | pkg_remove body: reverse-symlink undo + trash entry            | LANDED | #7    |
 | M2-005 | self-install bootstrap                                         | LANDED | #8    |
+| M3-001 | semantic-pipe: PackageManifest[] schema bind + emit on pkg list | LANDED | #9    |
+| M3-002 | semantic-pipe: InstallProgressRecord[] per install stage       | LANDED | #10   |
+| M3-003 | libpdx-audit: pre-output journal on every subcommand           | LANDED | #11   |
+| M3-004 | libpdx-elevate: KIND_PDXFS_FILE(write,/pkgs) 60s window        | LANDED | #12   |
 
 See `design/tooling/r49-r50-plan.md` §5.1 in paideia-os for the full
 breakdown (M1-M5) and cross-repo dependencies.
@@ -39,19 +44,22 @@ lookup seam (no readdir on `KIND_PDXFS_FILE` at paideia-os HEAD) with
 the same discipline. Silent-skip on either seam would violate D4
 (dual-signed install pillar) and I5 (undo record obligatory).
 
-## New source layout at M2 close
+## New source layout at M3 close
 
 ```
 src/
   print.pdx                    -- sys_write helper (M1)
+  audit_wire.pdx               -- libpdx-audit wire helper (M3-003)
+  pipe_schemas.pdx             -- libpdx-semantic-pipe schema bind/emit (M3-001/M3-002)
+  pkg_elevate.pdx              -- libpdx-elevate wrapper for /pkgs write (M3-004)
   kind_package_manifest.pdx    -- KIND_PACKAGE_MANIFEST 0x193 (M2-001)
   kind_package_repo.pdx        -- KIND_PACKAGE_REPO     0x192 (M2-002)
   manifest_codec.pdx           -- manifest.pdxsig decoder + verify seams (M2-003)
-  txn_client.pdx               -- KIND_PDXFS_TXN userspace wrappers (M2-003)
-  install.pdx                  -- pkg install <name> body (M2-003)
-  remove.pdx                   -- pkg remove <name> body + undo (M2-004)
-  subcommands_m1_stubs.pdx     -- verify + keys stubs (M2 pruned)
-  list.pdx                     -- pkg list body (M1; readdir upgrade at M3)
+  txn_client.pdx               -- KIND_PDXFS_TXN userspace wrappers (M3 real syscall)
+  install.pdx                  -- pkg install <name> body (M2-003 + M3-002/003/004)
+  remove.pdx                   -- pkg remove <name> body + undo (M2-004 + M3-003)
+  subcommands_m1_stubs.pdx     -- verify + keys stubs (M3-003 audit)
+  list.pdx                     -- pkg list body (M1 + M3-001 schema + M3-003 audit)
   dispatch.pdx                 -- routes install/remove to real bodies
   main.pdx                     -- pkg_main entry
 design/
@@ -84,13 +92,33 @@ bootstrap/
   `KIND_ELEVATE_CHANNEL = 0x191`, `KIND_PDXFS_FILE = 0x195`,
   `KIND_PDXFS_TXN = 0x196` (commits 411ad0e, e56a95b, 2ff76d4).
 
-## M3 blockers
+## M3 close status
 
-- **R42-PREP-007** (unfiled) — `sys_pdxfs_txn_open` + `PXT_OP_COMMIT`
-  + `PXT_OP_ABORT` handler paths on top of the R48b `kind_pdxfs_txn.pdx`
-  substrate. Softarch to file against paideia-os.
+- **R42-PREP-007** — LANDED at paideia-os (syscall #70 sys_pdxfs_txn_
+  open + PXT_OP_COMMIT/ABORT). TxnClient wire-through complete.
+- **libpdx-audit AuditWire** — wired for every subcommand
+  (list/install/remove/verify/keys); pre-output audit_begin + post-
+  emit audit_commit; broker-unavailable refuses with EXIT=3 per I5.
+- **libpdx-semantic-pipe PipeSchemas** — PackageManifest[] bound + one
+  demo record emitted on `pkg list`; InstallProgressRecord[] bound + one
+  record per stage (HEADER/HASH/VERIFY/MINT/TXN_OPEN/COMMIT) on
+  `pkg install`. Schema hashes are stable placeholder identifiers
+  (`pdxsig.pkg.pmf.v1` / `pdxsig.pkg.ipr.v1`) until M4 regenerates
+  BLAKE3s from the schema-definition files.
+- **libpdx-elevate PkgElevate** — request path wired for
+  KIND_PDXFS_FILE(write,/pkgs) with a 60s window. At M3 the paideia-os
+  elevate broker is not registered (paideia-os R48-PREP-005) so
+  elevate_client_request returns ELVC_ERR_LOOKUP_FAIL; pkg surfaces
+  this as parent_slot=0, txn_open refuses with PXT_MINT_BAD_PARENT, and
+  pi_err_parent renders the diagnostic. Path is shape-complete for M4.
+
+## M4 blockers (upstream — filed against paideia-os / paideia-as)
+
 - **paideia-as v0.33-crypto-kdf** — Argon2id-KDF + ChaCha20-Poly1305 +
-  ML-DSA-65 verify intrinsics. Blocks M3 verify wire-through.
+  ML-DSA-65 verify intrinsics. Blocks M4 sig-mismatch matrix.
+- **paideia-os R48-PREP-005** — svc.elevate-broker registration + auto-
+  approve policy table wiring for KIND_ELEVATE_CHANNEL. Blocks M4
+  live-elevate install path.
 - **`/system/packages/` readdir** — either an extension on
   `KIND_PDXFS_FILE` or a text `index.pdxlist` that pkg_install
-  maintains. Blocks M3 `pkg list --available` + `pkg remove` lookup.
+  maintains. Blocks `pkg list --available` full enumeration.

@@ -1,0 +1,234 @@
+// src/pkg_elevate.pdx -- pkg.M3-004 (#12)
+// PkgElevate module: pkg-side wrapper around libpdx-elevate's
+// ElevateClient::elevate_client_request. Requests
+// KIND_PDXFS_FILE(write, /pkgs) for a 60-second window and returns a
+// parent_slot the caller threads into TxnClient::txn_open.
+//
+// Scope
+// -----
+// r49-r50-plan.md §5.1 M3 line "libpdx-elevate: KIND_PDXFS_FILE(write,
+// /pkgs) request with 60s window" and §5.14 M2 line
+// "Cap<KIND_ELEVATE_CHANNEL=0x191> with bounded-lifetime self-
+// invalidation". D4 in design/tooling/plan.md: pkg never carries
+// ambient write authority on /pkgs -- every install acquires a bounded-
+// lifetime write cap via the elevate broker and drops it at txn close.
+//
+// At M3, the paideia-os elevate broker is not yet registered (§5.0
+// R48-PREP-005), so ElevateClient::elevate_client_request returns
+// ELVC_ERR_LOOKUP_FAIL (svc.elevate-broker miss) OR ELVC_STUB (broker
+// resolved but dispatch not wired at libpdx-elevate.M2). Both paths
+// surface as parent_slot = 0 from this wrapper; the caller's
+// TxnClient::txn_open then refuses with PXT_MINT_BAD_PARENT and
+// pkg_install_body branches to pi_err_parent with the operator-facing
+// diagnostic. When libpdx-elevate.M3 lands the reply-parse path, the
+// broker replies with a KIND_ELEVATE_CHANNEL cap slot in reply_buf +
+// 0 (the parent_slot for KIND_PDXFS_FILE writes under /pkgs); this
+// wrapper decodes it and returns it as-is.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module PkgElevate (PascalCase basename).
+//   - No `test` mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg,imm <= 0x7FFFFFFF (large-imm ELVC_* codes staged
+//     via r11 / r10).
+//   - r11 scratch.
+//   - Byte reads via xor rax,rax + mov_b (paideia-as #1248).
+
+module PkgElevate = structure {
+
+  // ---- Return codes ---------------------------------------------------
+  //
+  // A successful call returns a parent_slot in [1, 256) suitable to
+  // hand to TxnClient::txn_open. Slot 0 is reserved as the "elevate
+  // unavailable" sentinel -- txn_open on slot 0 refuses with
+  // PXT_MINT_BAD_PARENT which is exactly the shape pkg_install_body
+  // already handles at pi_err_parent. The M2 libpdx-elevate stub
+  // never returns a live cap so every M3 pkg install falls through
+  // slot 0 today; this is by design (§5.1 M3-004 says "request", not
+  // "grant" -- the granting side lands at libpdx-elevate.M3).
+  pub let PE_PARENT_UNAVAILABLE : u64 = 0
+
+  // ---- Elevate request parameters -------------------------------------
+  //
+  // Cap mask uses ElevateRequest::ELV_CAP_MASK_VALID = 0x00FF (bits
+  // 0..7 are semantically assigned; bit 0 = KIND_PDXFS_FILE(write, /
+  // pkgs) for the pkg-install path). Other bits (0x02 =
+  // KIND_NETWORK(fetch, pkgs.paideia-os), 0x04 = KIND_SIGNATURE(verify,
+  // paideia_root_pk)) land at M4 when the full install pipeline needs
+  // fetch + verify authority in the same 60s window; M3-004 requests
+  // only bit 0 because the M3 install body reads its manifest from a
+  // local staging buffer (no network) and the verify seams are still
+  // STUB pending paideia-as v0.33-crypto-kdf.
+  pub let PE_CAP_MASK_PDXFS_WRITE_PKGS : u64 = 0x01
+
+  // 60 seconds in nanoseconds. Matches design/user/model.md §5.1
+  // example ("pkg install requests /pkgs write for 60s") and is inside
+  // ElevateRequest's [ELV_DUR_MIN_NS=1s, ELV_DUR_MAX_NS=1h] range.
+  // 60_000_000_000 exceeds imm32 so it is staged via r10 at the call
+  // site (mov r10, 60000000000; mov rsi, r10 pattern per the
+  // large-imm compliance rule).
+  pub let PE_DURATION_60S_NS : u64 = 60000000000
+
+  // ---- Scratch buffers ------------------------------------------------
+  //
+  // ElevateRequest::ELEVATE_REQ_FRAME_BYTES = 32; a 64-byte allocation
+  // leaves headroom for the M4 APR reply body (32B header + up to
+  // 32B granted-cap descriptor). Both buffers are process-lifetime .bss
+  // so a caller does not have to marshal them onto its own frame.
+  pub let PE_SCRATCH_BYTES : u64 = 64
+  pub let mut _pe_req_buf : [u8; 64] = uninit @align(8)
+  pub let mut _pe_rep_buf : [u8; 64] = uninit @align(8)
+
+  // ---- Bookkeeping (populated across pkg_elevate_request) -------------
+  //
+  // Written on every call so a supervisor / test harness can inspect
+  // the outcome without following the return value only. _pe_last_rc
+  // is the raw ELVC_* return; _pe_parent_slot is what this wrapper
+  // returned (0 or a live slot).
+  pub let mut _pe_last_rc      : u64 = uninit @align(8)
+  pub let mut _pe_parent_slot  : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // pkg_elevate_reset() -> ()
+  //
+  // Zero the two bookkeeping slots so a subsequent call sees a known
+  // baseline. Scratch buffers are NOT zeroed here -- ElevateClient::
+  // elevate_client_request overwrites them fully on entry (or refuses
+  // before touching them, per its ELV_ERR_BAD_BUF contract), so a
+  // leftover from a prior call is safe.
+  //
+  // Leaf function.
+  // ==========================================================================
+  pub let pkg_elevate_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M3-004 pkg_elevate_reset: zero the two bookkeeping slots so a supervisor scanning _pe_last_rc / _pe_parent_slot after a call sees a known baseline. Not called on the hot path; pkg_main invokes it once at startup for parity with dispatch_reset / install_reset. Leaf function; r11 scratch. Labels: none.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + _pe_last_rc];     mov [r11], rax;
+        lea r11, [rip + _pe_parent_slot]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pkg_elevate_request_pdxfs_write_pkgs() -> parent_slot | 0
+  //
+  // Request a KIND_PDXFS_FILE(write, /pkgs) cap for a 60-second window
+  // via the libpdx-elevate client. On success, decode the reply frame
+  // (M4+) and return the parent_slot. On any failure or M3 stub, return
+  // 0 -- the caller's txn_open will refuse with PXT_MINT_BAD_PARENT and
+  // pkg_install_body's pi_err_parent branch surfaces the operator-facing
+  // diagnostic.
+  //
+  // Return:
+  //   [1, 256)                     -- live cap slot (M4+ happy path)
+  //   0 (PE_PARENT_UNAVAILABLE)    -- broker not registered, broker
+  //                                   returned stub, or reply frame
+  //                                   invalid. Every failure path
+  //                                   collapses to 0 because the caller
+  //                                   only needs one branch: "did I
+  //                                   get a slot or not?"
+  //
+  // ElevateClient::elevate_client_request return codes:
+  //   0        ELVC_OK               -- reply landed in _pe_rep_buf.
+  //                                     M4: decode the granted cap slot
+  //                                     from body word 0.
+  //   0xFFFFEA00 ELVC_STUB           -- M2 happy path (validated + broker
+  //                                     resolved, no dispatch yet).
+  //                                     Return 0.
+  //   0xFFFFEA0B ELVC_ERR_BAD_BUF    -- programmer bug at this seam
+  //                                     (buf is 0). Cannot happen here
+  //                                     because _pe_req_buf / _pe_rep_buf
+  //                                     are static .bss addresses. Return
+  //                                     0 defensively.
+  //   0xFFFFEA0E ELVC_ERR_PACK_FAIL  -- caps mask or duration invalid.
+  //                                     Constants above are inside
+  //                                     ELV_CAP_MASK_VALID + ELV_DUR_*
+  //                                     range, so this is a compile-time
+  //                                     invariant. Return 0 defensively.
+  //   0xFFFFEA0F ELVC_ERR_LOOKUP_FAIL -- svc.elevate-broker not
+  //                                     registered (M3 today; landing
+  //                                     path R48-PREP-005). Return 0.
+  //
+  // Register plan (leaf w.r.t. its own frame; nested-call frame):
+  //   Two callee-save pushes (r12, r13) + one sub rsp,8 pad = 24 bytes.
+  //   r12 = ELVC_* return from elevate_client_request (survives across
+  //         the reply-decode call at M4+; unused at M3).
+  //   r13 = decoded parent_slot (0 unless M4 ELVC_OK path runs).
+  //   Entry rsp%16 == 8; two pushes -> rsp%16 == 8; sub rsp,8 pad ->
+  //   rsp%16 == 0 for the nested elevate_client_request call.
+  //
+  // Effects tail: !{mem} @{} -- matches ElevateClient::elevate_client_
+  // request's own declaration at libpdx-elevate.M2. The library's
+  // M3 send/recv wire-through will widen to !{mem, sysreg} @{cap,
+  // sched}; this wrapper's declaration widens at the same commit so
+  // the two stay locked. Deliberately narrow now so paideia-as's
+  // effect checker does not accept an under-observed capability
+  // declaration during the M3 window.
+  // ==========================================================================
+  pub let pkg_elevate_request_pdxfs_write_pkgs : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M3-004 pkg_elevate_request_pdxfs_write_pkgs: wrap ElevateClient::elevate_client_request(caps=0x01, dur=60s, req_buf=&_pe_req_buf, reply_buf=&_pe_rep_buf). Duration 60_000_000_000 exceeds imm32 so it is staged via r10 (mov r10, 60000000000; mov rsi, r10). Two callee-save pushes (r12=raw ELVC_ rc, r13=decoded parent_slot) + one sub rsp,8 pad = 24 bytes; entry rsp%16 == 8 -> post-prologue == 0 for the nested elevate_client_request call. Result translation: ELVC_OK (0) -> M4 will decode reply frame word 0 as the granted cap slot; at M3 we do not have a live reply so the decode is short-circuited to 0 (the M4 caller replaces the xor r13,r13 with a real load). Any non-OK rc -> return 0 (PE_PARENT_UNAVAILABLE). Bookkeeping: _pe_last_rc receives the raw ELVC_ rc; _pe_parent_slot receives the returned slot (0 today). Effects tail !{mem} @{} matches libpdx-elevate.M2's own signature; the library's M3 wire-through widens to !{mem, sysreg} @{cap, sched} and this wrapper widens with it in the same commit. Labels prefixed pe_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                          // pad -> rsp%16 == 0
+
+        // Stage the 60s duration into r10 (imm > 0x7FFFFFFF requires
+        // r-reg staging per paideia-as compliance; rsi is the target).
+        mov r10, 60000000000;                // PE_DURATION_60S_NS
+        mov rsi, r10;
+
+        // Marshal ElevateClient::elevate_client_request args.
+        //   rdi = caps  = 0x01 (PE_CAP_MASK_PDXFS_WRITE_PKGS)
+        //   rsi = dur   = staged above from r10
+        //   rdx = req_buf
+        //   rcx = reply_buf
+        mov rdi, 1;                          // PE_CAP_MASK_PDXFS_WRITE_PKGS
+        lea rdx, [rip + _pe_req_buf];
+        lea rcx, [rip + _pe_rep_buf];
+        call ElevateClient::elevate_client_request;
+        mov r12, rax;                        // r12 = raw ELVC_ rc
+
+        // Persist raw rc for the supervisor bookkeeping.
+        lea r11, [rip + _pe_last_rc];
+        mov [r11], r12;
+
+        // Result translation.
+        //   rax == 0 (ELVC_OK) -> M4 path: decode reply body word 0
+        //                        as parent_slot. M3: no reply is
+        //                        actually delivered by the M2 library
+        //                        stub, so the OK arm is dead until
+        //                        libpdx-elevate.M3 lands. Kept as an
+        //                        explicit compare so the caller pattern
+        //                        does not shift when M4 flips.
+        //   rax != 0           -> collapse to 0 (PE_PARENT_UNAVAILABLE).
+        xor r13, r13;                        // r13 = 0 (parent_slot default)
+
+        cmp r12, 0;
+        jne pe_persist_and_return;
+
+        // ELVC_OK path (M4 decode; at M3 the library never returns 0,
+        // so this branch is unreachable today).
+        // At M4: `lea r11, [rip + _pe_rep_buf]; mov r13, [r11 + 0]`
+        // reads the granted cap slot from the reply frame's first
+        // body word. Kept as a comment to avoid a load-through-zero
+        // hazard if the library semantics shift before M4.
+        // xor r13, r13;                     // (redundant; kept for shape)
+
+      pe_persist_and_return:
+        // Persist decoded parent_slot for supervisor bookkeeping.
+        lea r11, [rip + _pe_parent_slot];
+        mov [r11], r13;
+
+        // Return parent_slot in rax.
+        mov rax, r13;
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

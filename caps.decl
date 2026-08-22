@@ -41,18 +41,17 @@ requires:
   # 411ad0e).
   - KIND_PDXFS_FILE (read, /system/packages/)
 
-# --- placeholder: elevate-broker binding -------------------------------
-# Reserved for the M3-004 wire-up. Uncomment when libpdx-elevate.M3 is
-# in-tree and the paideia-os elevate broker (R48.M7 at
-# src/kernel/core/ipc/elevate_broker.pdx) is running. In M1 the request
-# path stays on the shelf so `pkg list` does not require an approver
-# hop just to enumerate a directory it already has read authority on.
-#
-#   - KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)   # 0x191 R48.M7
-#
-# The M3 addition changes only this file; every other subcommand keeps
-# its M1 code path unchanged (the elevate request lives inside
-# pkg_install and pkg_remove, which are M2 bodies).
+# --- elevate-broker binding (M3-004) -----------------------------------
+# Enabled at M3-004: pkg_install invokes ElevateClient::elevate_client_
+# request on svc.elevate-broker to obtain a KIND_PDXFS_FILE(write,/pkgs)
+# cap for a 60-second window before opening the txn (see src/pkg_
+# elevate.pdx + src/install.pdx pi_elevate stage). At M3 the paideia-os
+# elevate broker is not yet registered (§5.0 R48-PREP-005) so the
+# request path resolves to svc_lookup miss; the invoke-right below is
+# still declared so libpdx-cap's cap_manifest_verify accepts the pkg
+# binary once the broker registration lands. Every other subcommand
+# (pkg list / verify / keys / remove) leaves this cap unused.
+  - KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)   # 0x191 R48.M7
 
 # Declared output schemas — the semantic-pipe schema records this tool
 # emits on its stdout. M3-001 wires PackageManifest[] on pkg list;

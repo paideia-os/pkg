@@ -217,7 +217,7 @@ module PkgInstall = structure {
   pub let pkg_install_body : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "pkg.M3-002 + M3-003 pkg_install_body. M3 upgrades over M2: (a) audit-first (I5) -- AuditWire::audit_begin_op fires BEFORE any output emission or state mutation; on broker unavailable, refuse with AUDIT_EXIT_BROKER_FAIL (3) without emitting any output; audit_id lives in _install_audit_id .bss so the epilogue can commit it without depending on register pressure. (b) semantic-pipe (M3-002) -- PipeSchemas::ps_bind_install_progress fires once after audit_begin (bind is inside the audited window per I5), then ps_emit_install_progress fires after every stage (HEADER/HASH/VERIFY/MINT/TXN_OPEN/COMMIT) with the actual rc so a supervisor consuming the schema-typed side of stdout sees one record per stage; r12/r13/r14 are SysV callee-save so they survive the emit calls without extra spill; the COMMIT stage saves rax to install_manifest_rc across the emit call and reloads for the branch. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient / PipeSchemas. Full pipeline (unchanged shape): pos_ptrs[1] check -> mc_reset -> mc_read_header -> mc_verify_body_hash SEAM -> mc_verify_signatures SEAM -> pmf_cap_mint_inner -> txn_open (real syscall #70) -> extract SEAM -> txn_commit (real cap_invoke). On any failure: txn_abort if txn was opened; pmf_cap_revoke if pmf row was minted. Five callee-save pushes (rbx/r12/r13/r14/r15) flip rsp%16 8->0 at every nested call. Labels prefixed pi_.",
+      justification: "pkg.M3-002 + M3-003 + M3-004 pkg_install_body. M3 upgrades over M2: (a) audit-first (I5) -- AuditWire::audit_begin_op fires BEFORE any output emission or state mutation; on broker unavailable, refuse with AUDIT_EXIT_BROKER_FAIL (3) without emitting any output; audit_id lives in _install_audit_id .bss so the epilogue can commit it without depending on register pressure. (b) semantic-pipe (M3-002) -- PipeSchemas::ps_bind_install_progress fires once after audit_begin (bind is inside the audited window per I5), then ps_emit_install_progress fires after every stage (HEADER/HASH/VERIFY/MINT/TXN_OPEN/COMMIT) with the actual rc so a supervisor consuming the schema-typed side of stdout sees one record per stage; r12/r13/r14 are SysV callee-save so they survive the emit calls without extra spill; the COMMIT stage saves rax to install_manifest_rc across the emit call and reloads for the branch. (c) libpdx-elevate (M3-004) -- PkgElevate::pkg_elevate_request_pdxfs_write_pkgs fires before Step 7 and stores its return into install_parent_slot; at M3 the elevate broker is not registered (paideia-os R48-PREP-005) so the return is 0 and txn_open surfaces PXT_MINT_BAD_PARENT at pi_err_parent (unchanged diagnostic). Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient / PkgElevate / PipeSchemas. Full pipeline (unchanged shape): pos_ptrs[1] check -> mc_reset -> mc_read_header -> mc_verify_body_hash SEAM -> mc_verify_signatures SEAM -> pmf_cap_mint_inner -> elevate -> txn_open (real syscall #70) -> extract SEAM -> txn_commit (real cap_invoke). On any failure: txn_abort if txn was opened; pmf_cap_revoke if pmf row was minted. Five callee-save pushes (rbx/r12/r13/r14/r15) flip rsp%16 8->0 at every nested call. Labels prefixed pi_.",
       block: {
         push rbx;
         push r12;
@@ -416,9 +416,22 @@ module PkgInstall = structure {
         cmp r13, r11;
         jae pi_err_mint;
 
+        // ---- M3-004: elevate for KIND_PDXFS_FILE(write, /pkgs) --------
+        // Ask libpdx-elevate for a 60-second /pkgs write cap BEFORE
+        // opening the txn. At M3 the elevate broker is not yet
+        // registered (paideia-os §5.0 R48-PREP-005) so the wrapper
+        // returns 0 (PE_PARENT_UNAVAILABLE) and install_parent_slot
+        // stays 0 -- txn_open then refuses with PXT_MINT_BAD_PARENT
+        // and pi_err_parent renders the operator-facing diagnostic.
+        // When libpdx-elevate.M3 lands the reply path this call
+        // returns a live slot without further changes at this seam.
+        call PkgElevate::pkg_elevate_request_pdxfs_write_pkgs;
+        lea r11, [rip + install_parent_slot];
+        mov [r11], rax;                      // 0 today; live slot at M4+
+
         // Step 7: open txn -- real syscall #70 (R42-PREP-007).
         // Args: parent_slot (from install_parent_slot; M3-004 elevate
-        // populates it, else 0 which fails PXT_MINT_BAD_PARENT), mode
+        // populates it above, 0 fails PXT_MINT_BAD_PARENT), mode
         // = TXN_MODE_CREATE, txn_id = install_id_next() (non-zero per
         // PXT_MINT_BAD_ID gate), wal_off = 0 (M3 default; the WAL is
         // append-only and the kernel picks the offset when the R42.M4
@@ -434,7 +447,7 @@ module PkgInstall = structure {
         mov r10, rax;
 
         lea r11, [rip + install_parent_slot];
-        mov rdi, [r11];                      // parent_slot (0 pre-elevate)
+        mov rdi, [r11];                      // parent_slot (elevate-granted)
         mov rsi, 1;                          // TXN_MODE_CREATE
         mov rdx, r10;                        // txn_id
         xor rcx, rcx;                        // wal_off
