@@ -96,9 +96,13 @@ module PkgInstall = structure {
     "pkg install: manifest cap mint refused (see errno)\n"
   pub let INSTALL_ERR_MINT_LEN : u64 = 51
 
-  pub let INSTALL_ERR_TXN : [u8; 66] =
-    "pkg install: KIND_PDXFS_TXN unavailable (R42-PREP-007 required)\n\n"
-  pub let INSTALL_ERR_TXN_LEN : u64 = 66
+  pub let INSTALL_ERR_TXN : [u8; 65] =
+    "pkg install: KIND_PDXFS_TXN open refused -- see errno on stderr\n\n"
+  pub let INSTALL_ERR_TXN_LEN : u64 = 65
+
+  pub let INSTALL_ERR_PARENT : [u8; 73] =
+    "pkg install: elevate did not grant KIND_MEMORY parent for /pkgs (M3-004)\n"
+  pub let INSTALL_ERR_PARENT_LEN : u64 = 73
 
   // ---- Install-progress state (populated across the pipeline) ----------
   // .bss singletons -- match the ParsedManifest / ParsedArgs shape so
@@ -108,6 +112,16 @@ module PkgInstall = structure {
   pub let mut install_pmf_row     : u64 = uninit @align(8)   // PMF row id or NONE
   pub let mut install_txn_slot    : u64 = uninit @align(8)   // TXN cap slot or 0
   pub let mut install_step        : u64 = uninit @align(8)   // last step index reached
+
+  // M3: monotonic install-id counter used as the txn_id passed to
+  // sys_pdxfs_txn_open (must be non-zero per PXT_MINT_BAD_ID gate).
+  // Not zeroed by install_reset -- process-lifetime monotonic so a
+  // second install in the same process gets a distinct txn_id.
+  pub let mut _install_id_counter : u64 = uninit @align(8)
+
+  // M3-004: parent_slot the elevate-broker granted for /pkgs. 0 until
+  // the reply arrives; 0 fails at PXT_MINT_BAD_PARENT in txn_open.
+  pub let mut install_parent_slot : u64 = uninit @align(8)
 
   pub let INSTALL_STEP_NONE     : u64 = 0
   pub let INSTALL_STEP_HEADER   : u64 = 1
@@ -132,7 +146,7 @@ module PkgInstall = structure {
   pub let install_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "pkg.M2-003 install_reset: zero every install-progress slot so a subsequent pkg_install_body call sees a known-empty state. Leaf function.",
+      justification: "pkg.M2-003 install_reset: zero every install-progress slot so a subsequent pkg_install_body call sees a known-empty state. _install_id_counter is NOT zeroed here -- it is a process-lifetime monotonic (same discipline as remove.pdx _remove_id_counter). install_parent_slot IS zeroed so a leftover slot from a previous install cannot leak into a fresh txn_open. Leaf function.",
       block: {
         xor rax, rax;
         lea r11, [rip + install_name_ptr];    mov [r11], rax;
@@ -140,6 +154,30 @@ module PkgInstall = structure {
         lea r11, [rip + install_pmf_row];     mov [r11], rax;
         lea r11, [rip + install_txn_slot];    mov [r11], rax;
         lea r11, [rip + install_step];        mov [r11], rax;
+        lea r11, [rip + install_parent_slot]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // install_id_next() -> u64
+  //
+  // Bump the monotonic install-id counter and return the new value.
+  // Starting value 1 (0 is the PXT_MINT_BAD_ID sentinel). Wrap is
+  // unreachable at process lifetimes (2^64 installs per invocation).
+  // Same shape as PkgRemove::remove_id_next; the two counters are
+  // deliberately independent so a mixed install/remove sequence does
+  // not have to serialise on one counter.
+  // ==========================================================================
+  pub let install_id_next : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M3 install_id_next: fetch-and-add on _install_id_counter. Not atomic (M3 single-thread) but the shape survives to multithread at M5+ where a lock-free fetch-add replaces the mov+add+mov triple. Leaf function.",
+      block: {
+        lea r11, [rip + _install_id_counter];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
         ret
       }
     }
@@ -189,7 +227,11 @@ module PkgInstall = structure {
         xor r13, r13;
         mov r11, 0xFF;                       // PMF_ROW_NONE
         mov r13, r11;                        // r13 = PMF_ROW_NONE (invalid)
-        xor r14, r14;                        // r14 = TXN_SLOT_NONE
+        // r14 = TXN_SLOT_NONE. 0 was a bug at M2 (slot 0 IS a valid
+        // cap_slot); use 0xFFFF (>= TXN_SLOT_CAP_MAX = 256) so the
+        // epilogue's `cmp r14, 256; jae skip_abort` correctly skips
+        // when txn_open never ran.
+        mov r14, 0xFFFF;                     // r14 = TXN_SLOT_NONE
         xor r15, r15;                        // r15 = exit code = 0 (OK)
 
         // Step 1: check pos_count == 2 (subcommand + one positional).
@@ -312,22 +354,51 @@ module PkgInstall = structure {
         cmp r13, r11;
         jae pi_err_mint;
 
-        // Step 7: open txn (SEAM).
+        // Step 7: open txn -- real syscall #70 (R42-PREP-007).
+        // Args: parent_slot (from install_parent_slot; M3-004 elevate
+        // populates it, else 0 which fails PXT_MINT_BAD_PARENT), mode
+        // = TXN_MODE_CREATE, txn_id = install_id_next() (non-zero per
+        // PXT_MINT_BAD_ID gate), wal_off = 0 (M3 default; the WAL is
+        // append-only and the kernel picks the offset when the R42.M4
+        // WAL substrate lands).
         mov r11, 5;                          // INSTALL_STEP_TXN_OPEN
         lea rax, [rip + install_step];
         mov [rax], r11;
 
-        mov rdi, 1;                          // TXN_MODE_CREATE
-        xor rsi, rsi;                        // snap_gen (stub)
-        xor rdx, rdx;                        // wal_off (stub)
+        // Allocate a distinct txn_id first so a caller reading
+        // install_id_next in a nested cycle sees the same monotonic
+        // series. r10 holds it across the arg marshalling below.
+        call install_id_next;
+        mov r10, rax;
+
+        lea r11, [rip + install_parent_slot];
+        mov rdi, [r11];                      // parent_slot (0 pre-elevate)
+        mov rsi, 1;                          // TXN_MODE_CREATE
+        mov rdx, r10;                        // txn_id
+        xor rcx, rcx;                        // wal_off
         call TxnClient::txn_open;
         mov r14, rax;
         lea r11, [rip + install_txn_slot];
         mov [r11], r14;
-        // Stubs return TXN_STUB (0xFFFFEA80); any high-band value fails.
-        mov r11, 0xFFFFEA00;
+        // Success: rax in [0, 256). Any rax >= 256 is a mint sentinel
+        // (0xFFFFEC1x band) or -ENFILE (0xFFFFFFFFFFFFFFDF). PXT_MINT_
+        // BAD_PARENT (0xFFFFEC2D) is the one we expect at M3 while
+        // libpdx-elevate.M2 still returns ELVC_STUB from its request
+        // path -- diagnostic-branch on it so a maintainer knows the
+        // elevate reply is the missing piece rather than a txn-model
+        // bug. All other high-band returns hit the generic TXN error
+        // path.
+        mov r11, 256;                        // TXN_SLOT_CAP_MAX
         cmp r14, r11;
-        jae pi_err_txn;
+        jb  pi_txn_open_ok;
+        // Refused. Distinguish BAD_PARENT (elevate not granted) from
+        // every other failure so the diagnostic is actionable.
+        mov r11, 0xFFFFEC2D;                 // PXT_MINT_BAD_PARENT
+        cmp r14, r11;
+        je  pi_err_parent;
+        jmp pi_err_txn;
+
+      pi_txn_open_ok:
 
         // Step 8: extract (STUB) -- one txn write per FILE_INVENTORY
         // record. M4 lands the per-file walk against a fixture manifest;
@@ -343,9 +414,9 @@ module PkgInstall = structure {
 
         mov rdi, r14;                        // slot
         call TxnClient::txn_commit;
-        mov r11, 0xFFFFEA00;
-        cmp rax, r11;
-        jae pi_err_txn;
+        // Success: rax == 0. TXN_KERNEL / PXT_BAD_TRANSITION both fail.
+        cmp rax, 0;
+        jne pi_err_txn;
 
         // Success. Exit 0.
         xor r15, r15;
@@ -389,19 +460,28 @@ module PkgInstall = structure {
 
       pi_err_txn:
         lea rdi, [rip + INSTALL_ERR_TXN];
-        mov rsi, 66;                         // INSTALL_ERR_TXN_LEN
+        mov rsi, 65;                         // INSTALL_ERR_TXN_LEN
+        call Print::print_err;
+        mov r15, 1;
+        jmp pi_epilogue;
+
+      pi_err_parent:
+        lea rdi, [rip + INSTALL_ERR_PARENT];
+        mov rsi, 73;                         // INSTALL_ERR_PARENT_LEN
         call Print::print_err;
         mov r15, 1;
 
       pi_epilogue:
-        // Cleanup: if a txn was opened successfully (r14 < 0xFFFFEA00),
-        // abort it. If a pmf row was minted (r13 < 0xFF), revoke it.
-        // Both are best-effort -- ignore return codes.
-        mov r11, 0xFFFFEA00;
+        // Cleanup: if a txn was opened successfully (r14 < 256 --
+        // TXN_SLOT_CAP_MAX), abort it. If a pmf row was minted
+        // (r13 < 0xFF), revoke it. Both are best-effort -- ignore
+        // return codes. NB: r14 == 0 IS a valid slot 0 return -- we
+        // used to treat it as "no slot" but that conflates cap_slot 0
+        // with the sentinel; instead, gate on "did txn_open even
+        // succeed" via the same range check the success path uses.
+        mov r11, 256;                        // TXN_SLOT_CAP_MAX
         cmp r14, r11;
         jae pi_ep_check_pmf;
-        cmp r14, 0;
-        je  pi_ep_check_pmf;
         // Only abort if we didn't already commit (r15 != 0 => we bailed).
         cmp r15, 0;
         je  pi_ep_check_pmf;

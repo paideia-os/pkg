@@ -15,7 +15,7 @@
 # build-out/pkg.caps for the InitCap sidecar packaging step at M5.
 
 name        = pkg
-version     = 0.2.0-m2
+version     = 0.3.0-m3
 kind        = tool
 entry       = PkgMain::pkg_main
 output      = build-out/pkg
