@@ -1,13 +1,14 @@
 # pkg — status
 
 **Wave:** R49 (Wave 1)
-**Current milestone:** M5 (1.0 signed release) — M5-001 LANDED.
-M5-002 pending (`pkgs.paideia-os` mirror-push protocol +
-`doc/pkg.pdxdoc`).
+**Current milestone:** M5 (1.0 signed release) — CLOSED.
+All 17 issues (#1-#17) landed across M1-M5. Ready for git tag
+`pkg-v1.0.0`.
 
 **Release:** 1.0.0 (`manifest.pdxproj` version 1.0.0). Signing
 state STUB at M5-close (v0.33-crypto-kdf gate); diff-flip when the
-crypto substrate lands. See `release/1.0/README.md` §3.
+crypto substrate lands. See `release/1.0/README.md` §3 and
+`release/mirror-push.md` §7 for substrate-gate carry-forward.
 
 ## Milestone rollup
 
@@ -29,7 +30,7 @@ crypto substrate lands. See `release/1.0/README.md` §3.
 | M4-002 | partial-install rollback via KIND_PDXFS_TXN abort              | LANDED | #14   |
 | M4-003 | QEMU smoke: install -> list -> verify -> remove -> verify absent | LANDED | #15   |
 | M5-001 | dual-signed manifest.pdxsig for pkg v1.0 + CHANGELOG entry     | LANDED | #16   |
-| M5-002 | pkgs.paideia-os mirror push + .pdxdoc for doc pkg              | OPEN   | #17   |
+| M5-002 | pkgs.paideia-os mirror push + .pdxdoc for doc pkg              | LANDED | #17   |
 
 See `design/tooling/r49-r50-plan.md` §5.1 in paideia-os for the full
 breakdown (M1-M5) and cross-repo dependencies.
@@ -192,10 +193,36 @@ gate is the only diff-flip point.
   directory tree, byte layout, STUB envelope, CHANGELOG discipline,
   mirror-push protocol, `.pdxdoc` shape, substrate gates).
 
-## M5-002 (next)
+## M5-002 close status
 
-Per `design/tooling/r49-r50-plan.md` §5.1 M5 line and
-`design/release-1.0.md` §6-§7: `pkgs.paideia-os` mirror-push
-protocol (`release/mirror-push.md` + `release/mirror-push.sh`) and
-the `.pdxdoc` file for `doc pkg` (`doc/pkg.pdxdoc`). Landing
-M5-002 closes M5 and enables the `pkg-v1.0.0` git tag.
+M5-002 lands the mirror-push protocol + the `.pdxdoc` file for
+`doc pkg`. Every artefact is exercisable at M5-close via
+`PDX_DRY_RUN=1`; live network writes wait on `pkgs.paideia-os`
+provisioning + paideia-as v0.33-crypto-kdf.
+
+- `doc/pkg.pdxdoc` — text-format doc-tool consumable rendering
+  `doc pkg`. Section order: NAME / SYNOPSIS / DESCRIPTION /
+  SUBCOMMANDS / CAPS / EXAMPLES / SEE ALSO / AUDIT / VERSION.
+  Cross-references via `see:<tool>` markers for doc.M3+
+  hyperlink upgrades.
+- `release/mirror-push.md` — protocol document: mirror layout,
+  10-step upload sequence, atomic-swap index update, immutability
+  + rotation policy, substrate gates.
+- `release/mirror-push.sh` — POSIX-sh driver. Reads manifest.pdxsig
+  identity (name + version) via KV parse, pre-flights immutability
+  against remote HEAD, PUTs `.pending` files, atomic-MOVE swaps to
+  canonical names, re-signs and swaps `index.pdxsig`. Default
+  `PDX_DRY_RUN=1` at M5-close prints the sequence without any
+  network write.
+- STATUS.md: M5 CLOSED rollup.
+
+## Post-M5 (release + tag)
+
+- Git tag: `pkg-v1.0.0` at HEAD of main after M5-002 commit.
+- Mirror push: manual `release/mirror-push.sh` invocation
+  when `pkgs.paideia-os` provisions + v0.33-crypto-kdf lands.
+- The four substrate gates listed under "Substrate gates still
+  blocking full-green M4" carry forward as post-1.0 open items;
+  every gate has a diff-flip artefact pinned in either the M4
+  test-matrix expected files or the release/1.0/ + release/
+  mirror-push.md documents.
