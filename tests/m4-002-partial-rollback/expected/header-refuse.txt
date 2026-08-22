@@ -1,0 +1,13 @@
+# M4-002 header-refuse expected outcome (M3-close substrate)
+#
+# Bare `pkg install pkg` invocation: _install_staging is zero-init,
+# mc_read_header returns MC_ERR_MAGIC, pi_err_header fires, exit 1.
+# Cleanup branch A -- no txn, no PMF row, nothing to roll back.
+# The absence of a crash after the error print is the load-bearing
+# assertion (a botched epilogue would surface as a paideia-os fault
+# trap, exit 139/signal 11 on POSIX or a fault code in QEMU).
+#
+# See design/test-matrix.md §3.
+
+exit=1
+stderr[0]=pkg install: header parse failed (see errno)

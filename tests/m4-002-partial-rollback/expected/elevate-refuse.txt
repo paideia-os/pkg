@@ -1,0 +1,19 @@
+# M4-002 elevate-refuse expected outcome (post-wire-in substrate,
+# still-missing R48-PREP-005 broker)
+#
+# Not reachable at M4-close (the header-refuse cell fires first).
+# When the KIND_PDXFS_FILE fixture wire-in lands and mc_read_header
+# passes for a well-formed fixture, mc_verify_body_hash + mc_verify_
+# signatures still return STUBs -- so this exact expected value is
+# only reached IF the verify SEAMs are quietly bypassed OR the
+# fixture carries "known-good" placeholder hashes/sigs the SEAM
+# accepts. Both are M5+ substrate concerns.
+#
+# The expected file is kept in tree so the M5 driver uplift is a
+# one-line addition (uncomment the elevate-refuse cell in run.sh)
+# and the assertion is already pinned.
+#
+# See design/test-matrix.md §3.1 (elevate-refuse row).
+
+exit=1
+stderr[0]=pkg install: elevate did not grant KIND_MEMORY parent for /pkgs (M3-004)
