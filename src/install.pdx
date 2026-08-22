@@ -67,7 +67,7 @@
 //
 // paideia-as compliance -- same discipline as PkgMain.
 
-module PkgInstall = structure {
+module Install = structure {
 
   // ---- Diagnostic strings ---------------------------------------------
   pub let INSTALL_USAGE_MSG : [u8; 32] =

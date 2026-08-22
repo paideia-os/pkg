@@ -35,7 +35,7 @@
 //   - 1-push prologue (rbx unused body-side but keeps rsp%16 == 0 for
 //     the nested Print::print_str call; a leaf-alignment discipline).
 
-module PkgSubcommandsM1 = structure {
+module SubcommandsM1Stubs = structure {
 
   // -- Exit code shared by all four stubs -------------------------------
   // Consumers (shell, test harness) match on 3 for the "not yet

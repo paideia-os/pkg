@@ -47,7 +47,7 @@
 //   Dispatch::dispatch_no_subcommand (this repo)
 //   Print::print_err             (this repo)
 
-module PkgMain = structure {
+module Main = structure {
 
   // -- Local diagnostic strings -----------------------------------------
   // Emitted when libpdx-argv reports a parse error. M3-002 replaces

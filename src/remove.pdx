@@ -60,7 +60,7 @@
 //
 // paideia-as compliance -- same as PkgInstall.
 
-module PkgRemove = structure {
+module Remove = structure {
 
   // ---- Constants -------------------------------------------------------
   // "pdxundo\0" little-endian.

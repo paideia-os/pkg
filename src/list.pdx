@@ -31,7 +31,7 @@
 //     of callee-save regs would be required if we crossed a call with
 //     live state; the M1 body keeps state in .bss instead).
 
-module PkgList = structure {
+module List = structure {
 
   // -- M1 output strings -------------------------------------------------
   // Header printed first. The trailing NUL is not emitted (len bounds
