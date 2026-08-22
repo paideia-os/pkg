@@ -1,0 +1,635 @@
+// src/kind_package_repo.pdx -- pkg.M2-002
+// KindPackageRepo module: userspace-defined derived-kind
+// KIND_PACKAGE_REPO = 0x192, derived over KIND_NETWORK (existing).
+//
+// Scope
+// -----
+// Per r49-r50-plan.md §5.1: "KIND_PACKAGE_REPO (proposed, derived over
+// KIND_NETWORK) -- a per-repo cap; holding it grants fetch rights to
+// exactly that repo's URL prefix. Rate-limited via the elevate-policy
+// substrate."
+//
+// This file lands the ordinal + fetch-rights narrowing helper. Holding
+// a live row means the process has been granted fetch authority scoped
+// to exactly one repo URL prefix -- a strictly narrower cap than the
+// underlying KIND_NETWORK the elevate broker delegates from. The
+// per-repo scoping is the userspace enforcement point for the D4
+// "signed binary packages from known repos" pillar: a compromised
+// process holding a KIND_PACKAGE_REPO cap for pkgs.paideia-os can only
+// fetch bytes matching that URL prefix, not arbitrary network resources.
+//
+// Row layout (48 bytes, six u64 words):
+//
+//   [+0]   header: in_use[63:56] | state[15:8] | flags[7:0]
+//   [+8]   fetch_rights (u64)         -- bitmask (see PRP_R_FETCH_*)
+//   [+16]  rate_bytes_per_sec (u64)   -- rate limit for the pkg.tar
+//                                        stream; 0 = unlimited (test)
+//   [+24]  rate_burst_bytes (u64)     -- burst allowance for the token
+//                                        bucket; 0 = unlimited (test)
+//   [+32]  url_prefix_hash_lo (u64)   -- first 8B of sha3-256(url_prefix)
+//   [+40]  url_prefix_hash_hi (u64)   -- next  8B of sha3-256(url_prefix)
+//
+// The URL prefix itself lives in the elevate-broker's policy table --
+// this row records a HANDLE (its sha3-256 fingerprint) not the string,
+// so a compromised pkg cannot rewrite the URL a cap points at. Fetch
+// wrappers translate a fetch attempt through the elevate broker; the
+// broker checks the prefix against the cap's fingerprint. Both halves
+// of the sha3-256 (128 bits) are stored because a 64-bit hash under an
+// adversarial URL selection is thin.
+//
+// State byte:
+//   PRP_STATE_ACTIVE   = 1   -- valid; fetch wrappers may use it
+//   PRP_STATE_EXHAUSTED = 2  -- rate cap fully consumed (M3+)
+//   PRP_STATE_REVOKED  = 3
+//
+// Rights (fetch_rights bitmask):
+//   PRP_R_FETCH_INDEX     0x001 -- may fetch <repo>/index.pdxsig
+//   PRP_R_FETCH_MANIFEST  0x002 -- may fetch <repo>/<name>/<v>/manifest.pdxsig
+//   PRP_R_FETCH_TAR       0x004 -- may fetch <repo>/<name>/<v>/pkg.tar
+//   PRP_R_FETCH_KEYS      0x008 -- may fetch <repo>/keys/<key-fpr>.pdxkey
+//
+// A common M3 shape is "narrow to INDEX only" for the initial repo
+// probe, then "narrow further to MANIFEST + TAR" once a specific
+// package is being installed. Every narrowing is a subset check --
+// widening is refused at the userspace helper before it reaches the
+// broker.
+//
+// paideia-as compliance -- same discipline as kind_package_manifest.pdx.
+
+module KindPackageRepo = structure {
+
+  // ---- Ordinal ---------------------------------------------------------
+  // 0x192 per r49-r50-plan.md §5. Adjacent-below the manifest kind
+  // (0x193) so the two pkg-introduced ordinals sit next to each other
+  // in the derived-kind block.
+  pub let KIND_PACKAGE_REPO      : u64 = 0x192
+  pub let KIND_PACKAGE_REPO_BASE : u64 = 0                // = KIND_NETWORK
+  // (KIND_NETWORK ordinal is TBD in the R43+ network wave; the base
+  // slot 0 here is a sentinel meaning "grounds out in the elevate-
+  // broker's network delegation" pending the R43 allocation. Softarch
+  // adjusts this on the round the KIND_NETWORK ordinal lands.)
+
+  // ---- States ----------------------------------------------------------
+  pub let PRP_STATE_ACTIVE    : u64 = 1
+  pub let PRP_STATE_EXHAUSTED : u64 = 2
+  pub let PRP_STATE_REVOKED   : u64 = 3
+  pub let PRP_STATE_MAX       : u64 = 3
+
+  // ---- Fetch rights bitmask -------------------------------------------
+  pub let PRP_R_FETCH_INDEX    : u64 = 0x001
+  pub let PRP_R_FETCH_MANIFEST : u64 = 0x002
+  pub let PRP_R_FETCH_TAR      : u64 = 0x004
+  pub let PRP_R_FETCH_KEYS     : u64 = 0x008
+  pub let PRP_R_FETCH_ALL      : u64 = 0x00F   // union of the four above
+
+  // ---- Failure taxonomy -- 0xFFFFEC40..0xFFFFEC4F ---------------------
+  // Disjoint from KIND_PDXFS_FILE (0xFFFFEC20), KIND_PDXFS_TXN
+  // (0xFFFFEC10), and KIND_PACKAGE_MANIFEST (0xFFFFEC30) so the four
+  // are inspectable-by-value.
+  pub let PRP_OK              : u64 = 0
+  pub let PRP_TAIL_ENOSPC     : u64 = 0xFFFFEC4F
+  pub let PRP_TAIL_BAD_ARG    : u64 = 0xFFFFEC4E
+  pub let PRP_MINT_BAD_RIGHTS : u64 = 0xFFFFEC4D   // rights not subset of ALL
+  pub let PRP_MINT_BAD_HASH   : u64 = 0xFFFFEC4C   // url_prefix_hash zero
+  pub let PRP_NARROW_WIDENING : u64 = 0xFFFFEC4B   // narrow tries to grant a
+                                                   // right the parent lacks
+  pub let PRP_NARROW_BAD_ROW  : u64 = 0xFFFFEC4A   // parent row_id invalid
+  pub let PRP_BAD_SLOT        : u64 = 0xFFFFEC48
+  pub let PRP_REVOKE_ALREADY  : u64 = 0xFFFFEC46
+
+  pub let PRP_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let PRP_ROW_NONE   : u64 = 0xFF
+
+  // ---- Table ----------------------------------------------------------
+  // Four rows -- deliberately narrower than the manifest table.
+  // Typical shape: one row for the founder-declared default repo
+  // (pkgs.paideia-os), one row for a per-install narrowed sub-cap, and
+  // two headroom slots for a future mirror or a local file:// fixture.
+  // 4 * 48 = 192 bytes = 24 u64.
+  pub let PRP_MAX       : u64 = 4
+  pub let PRP_ROW_BYTES : u64 = 48
+  pub let mut _prp_table : [u64; 24] = uninit @align(64)
+  pub let mut _prp_stats : [u64; 8]  = uninit @align(64)
+
+  pub let PRP_ST_MINTS   : u64 = 0
+  pub let PRP_ST_REVOKES : u64 = 1
+  pub let PRP_ST_QUERIES : u64 = 2
+  pub let PRP_ST_REFUSED : u64 = 3
+  pub let PRP_ST_NARROWS : u64 = 4
+
+  // ==========================================================================
+  // prp_table_reset() -> ()
+  // ==========================================================================
+  pub let prp_table_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_table_reset: clear every row and every stat counter. Two separate loops per the kind_pdxfs_file convention. Labels prefixed kpr_rs_.",
+      block: {
+        lea r10, [rip + _prp_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      kpr_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 24;
+        jb  kpr_rs_rows;
+
+        lea r10, [rip + _prp_stats];
+        xor rcx, rcx;
+      kpr_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  kpr_rs_stats;
+        ret
+      }
+    }
+
+  pub let prp_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_note: bounded stat increment. Labels prefixed kpr_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae kpr_nt_out;
+        lea r10, [rip + _prp_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      kpr_nt_out:
+        ret
+      }
+    }
+
+  pub let prp_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_stat: bounded stat read. Labels prefixed kpr_st_.",
+      block: {
+        cmp rdi, 8;
+        jae kpr_st_zero;
+        lea r10, [rip + _prp_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      kpr_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // prp_rights_valid(rights) -> 1 | 0
+  //
+  // 1 iff (rights & ~PRP_R_FETCH_ALL) == 0 -- rights bits set in the
+  // caller's mask are all inside the recognised vocabulary. This is
+  // the userspace mirror of KindPdxfsFile.pdxfs_file_rights_valid.
+  // ==========================================================================
+  pub let prp_rights_valid : (u64) -> u64 !{} @{} =
+    fn (rights: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "pkg.M2-002 prp_rights_valid: subset test against PRP_R_FETCH_ALL = 0x00F. Labels prefixed kpr_rv_.",
+      block: {
+        mov rax, rdi;
+        mov r10, 0x00F;
+        and rax, r10;
+        cmp rax, rdi;
+        jne kpr_rv_no;
+        mov rax, 1;
+        ret;
+      kpr_rv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let prp_tail_valid : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_tail_valid: row-liveness gate. Labels prefixed kpr_tv_.",
+      block: {
+        cmp rdi, 4;
+        jae kpr_tv_no;
+        lea r10, [rip + _prp_table];
+        mov r11, rdi;
+        shl r11, 5;
+        mov rax, rdi;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  kpr_tv_no;
+        mov rax, 1;
+        ret;
+      kpr_tv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let prp_tail_free : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_tail_free: scrub row. Labels prefixed kpr_tf_.",
+      block: {
+        cmp rdi, 4;
+        jae kpr_tf_out;
+        lea r10, [rip + _prp_table];
+        mov r11, rdi;
+        shl r11, 5;
+        mov rax, rdi;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+      kpr_tf_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // prp_cap_mint_root(fetch_rights, rate_bps, rate_burst,
+  //                   url_prefix_hash_lo, url_prefix_hash_hi)
+  //   -> row_id | PRP_MINT_*
+  //
+  // Claim one row for a repo cap that grounds out at the elevate
+  // broker's network delegation (no parent row -- this is a root cap
+  // for this process). Called by pkg_install at the point the elevate
+  // broker returns an approved KIND_NETWORK sub-cap; pkg re-wraps that
+  // into a KIND_PACKAGE_REPO row scoped to the intended URL prefix.
+  //
+  // Gates in order:
+  //   (1) fetch_rights subset of PRP_R_FETCH_ALL -> or BAD_RIGHTS.
+  //   (2) url_prefix_hash both halves nonzero -> or BAD_HASH (an
+  //       all-zero hash is the free-slot sentinel and a real
+  //       sha3-256(url_prefix) is astronomically unlikely to hit
+  //       both halves zero simultaneously).
+  //   (3) low-first free-slot scan -> or ENOSPC.
+  //
+  // Success writes state=PRP_STATE_ACTIVE, bumps MINTS.
+  // ==========================================================================
+  pub let prp_cap_mint_root : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (fetch_rights: u64) (rate_bps: u64) (rate_burst: u64) (url_prefix_hash_lo: u64) (url_prefix_hash_hi: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_cap_mint_root: root-cap mint. Six callee-save pushes + sub rsp, 8 = 56 bytes; post-prologue rsp%16 == 0 for the nested prp_rights_valid + prp_note calls. Header packing writes in_use=1<<56 | PRP_STATE_ACTIVE (=1) << 8; state at [15:8], flags at [7:0] zero. Labels prefixed kpr_mi_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov r12, rdi;                    // fetch_rights
+        mov r13, rsi;                    // rate_bps
+        mov r14, rdx;                    // rate_burst
+        mov r15, rcx;                    // url_prefix_hash_lo
+        mov rbp, r8;                     // url_prefix_hash_hi
+
+        // (1) rights subset check.
+        mov rdi, r12;
+        call prp_rights_valid;
+        cmp rax, 0;
+        je  kpr_mi_bad_rights;
+
+        // (2) url_prefix hash both halves nonzero.
+        mov rax, r15;
+        or  rax, rbp;
+        cmp rax, 0;
+        je  kpr_mi_bad_hash;
+
+        // (3) low-first scan.
+        xor rbx, rbx;
+      kpr_mi_scan:
+        cmp rbx, 4;
+        jae kpr_mi_enospc;
+
+        lea r10, [rip + _prp_table];
+        mov r11, rbx;
+        shl r11, 5;
+        mov rax, rbx;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  kpr_mi_claim;
+
+        add rbx, 1;
+        jmp kpr_mi_scan;
+
+      kpr_mi_claim:
+        // Pack header: in_use=1<<56 | (PRP_STATE_ACTIVE=1 << 8).
+        mov rax, 1;
+        shl rax, 56;
+        mov r11, 1;                      // PRP_STATE_ACTIVE
+        shl r11, 8;
+        or  rax, r11;
+        mov [r10 + 0],  rax;
+
+        mov [r10 + 8],  r12;             // fetch_rights
+        mov [r10 + 16], r13;             // rate_bps
+        mov [r10 + 24], r14;             // rate_burst
+        mov [r10 + 32], r15;             // url_prefix_hash_lo
+        mov [r10 + 40], rbp;             // url_prefix_hash_hi
+
+        mov rax, rbx;                    // row_id return
+
+        push rax;
+        mov rdi, 0;                      // PRP_ST_MINTS
+        call prp_note;
+        pop rax;
+        jmp kpr_mi_out;
+
+      kpr_mi_enospc:
+        mov rax, 0xFFFFEC4F;
+        jmp kpr_mi_refused;
+      kpr_mi_bad_rights:
+        mov rax, 0xFFFFEC4D;
+        jmp kpr_mi_refused;
+      kpr_mi_bad_hash:
+        mov rax, 0xFFFFEC4C;
+
+      kpr_mi_refused:
+        push rax;
+        mov rdi, 3;                      // PRP_ST_REFUSED
+        call prp_note;
+        pop rax;
+
+      kpr_mi_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // prp_narrow_fetch_rights(parent_row_id, new_rights) -> new_row_id
+  //                                                      | PRP_NARROW_*
+  //
+  // Derive a NARROWER child from an existing repo row. The child
+  // inherits the parent's URL-prefix hash + rate limits and takes a
+  // strict-subset of the parent's fetch rights.
+  //
+  // The widen check `(new_rights & ~parent_rights) == 0` mirrors
+  // libpdx-cap.cap_pack_narrowed at M2-002: any bit set in new_rights
+  // that is CLEAR in the parent's rights would widen authority the
+  // caller does not itself hold. Refused with PRP_NARROW_WIDENING
+  // before any row claim.
+  //
+  // Also checks:
+  //   * parent_row_id names a live row (prp_tail_valid) -> or BAD_ROW.
+  //   * new_rights subset of PRP_R_FETCH_ALL (defensive) -> BAD_RIGHTS.
+  //
+  // On success bumps PRP_ST_NARROWS (distinct from ST_MINTS so the
+  // stats surface the narrowing traffic separately -- a runaway
+  // narrower is a signal a caller is over-fragmenting the cap chain).
+  // ==========================================================================
+  pub let prp_narrow_fetch_rights : (u64, u64) -> u64 !{mem} @{} =
+    fn (parent_row_id: u64) (new_rights: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_narrow_fetch_rights: derive a narrower child from an existing repo row. Widen check `(new & ~parent) == 0` mirrors libpdx-cap.cap_pack_narrowed's discipline. Fail-fast: widen refusal precedes the free-slot scan so a broken narrowing policy surfaces even if the table would refuse for other reasons. Six callee-save pushes + sub rsp, 8 = 56 bytes; post-prologue rsp%16 == 0. Labels prefixed kpr_nf_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov r12, rdi;                    // parent_row_id
+        mov r13, rsi;                    // new_rights
+
+        // Gate: parent row alive?
+        mov rdi, r12;
+        call prp_tail_valid;
+        cmp rax, 0;
+        je  kpr_nf_bad_row;
+
+        // Gate: new_rights inside recognised vocabulary?
+        mov rdi, r13;
+        call prp_rights_valid;
+        cmp rax, 0;
+        je  kpr_nf_bad_rights;
+
+        // Read parent's fetch_rights at [row*48 + 8].
+        lea r10, [rip + _prp_table];
+        mov r11, r12;
+        shl r11, 5;
+        mov rax, r12;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+        mov r14, [r10 + 8];              // parent fetch_rights
+
+        // Widen check: (new & ~parent) == 0.
+        mov rax, r14;
+        not rax;
+        and rax, r13;
+        cmp rax, 0;
+        jne kpr_nf_widening;
+
+        // Read parent's rate_bps / rate_burst / hash halves.
+        mov rbp, [r10 + 16];             // rate_bps
+        mov r15, [r10 + 24];             // rate_burst
+        // hash halves loaded from parent below (rax scratched)
+
+        // Low-first free-slot scan for the child.
+        xor rbx, rbx;
+      kpr_nf_scan:
+        cmp rbx, 4;
+        jae kpr_nf_enospc;
+
+        lea r10, [rip + _prp_table];
+        mov r11, rbx;
+        shl r11, 5;
+        mov rax, rbx;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  kpr_nf_claim;
+
+        add rbx, 1;
+        jmp kpr_nf_scan;
+
+      kpr_nf_claim:
+        // Pack header: in_use | ACTIVE state.
+        mov rax, 1;
+        shl rax, 56;
+        mov r11, 1;
+        shl r11, 8;
+        or  rax, r11;
+        mov [r10 + 0],  rax;
+
+        mov [r10 + 8],  r13;             // NARROWED fetch_rights
+        mov [r10 + 16], rbp;             // rate_bps inherited
+        mov [r10 + 24], r15;             // rate_burst inherited
+
+        // Copy hash halves from parent (re-fetch from parent row --
+        // r14 was clobbered by the widen check).
+        lea r11, [rip + _prp_table];
+        mov r8,  r12;
+        shl r8,  5;
+        mov rax, r12;
+        shl rax, 4;
+        add r8,  rax;
+        add r11, r8;
+        mov r14, [r11 + 32];             // hash_lo
+        mov rbp, [r11 + 40];             // hash_hi
+        mov [r10 + 32], r14;
+        mov [r10 + 40], rbp;
+
+        mov rax, rbx;                    // new row_id return
+
+        push rax;
+        mov rdi, 4;                      // PRP_ST_NARROWS
+        call prp_note;
+        pop rax;
+        jmp kpr_nf_out;
+
+      kpr_nf_enospc:
+        mov rax, 0xFFFFEC4F;
+        jmp kpr_nf_refused;
+      kpr_nf_widening:
+        mov rax, 0xFFFFEC4B;
+        jmp kpr_nf_refused;
+      kpr_nf_bad_row:
+        mov rax, 0xFFFFEC4A;
+        jmp kpr_nf_refused;
+      kpr_nf_bad_rights:
+        mov rax, 0xFFFFEC4D;
+
+      kpr_nf_refused:
+        push rax;
+        mov rdi, 3;                      // PRP_ST_REFUSED
+        call prp_note;
+        pop rax;
+
+      kpr_nf_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let prp_cap_revoke : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_cap_revoke: scrub row + bump REVOKES; distinguishes out-of-range from already-dead. Labels prefixed kpr_cr_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        cmp r12, 4;
+        jae kpr_cr_bad_slot;
+
+        mov rdi, r12;
+        call prp_tail_valid;
+        cmp rax, 0;
+        je  kpr_cr_already;
+
+        mov rdi, r12;
+        call prp_tail_free;
+        mov rdi, 1;
+        call prp_note;
+        xor rax, rax;
+        jmp kpr_cr_out;
+
+      kpr_cr_bad_slot:
+        mov rax, 0xFFFFEC48;
+        jmp kpr_cr_out;
+      kpr_cr_already:
+        mov rax, 0xFFFFEC46;
+
+      kpr_cr_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors -- each returns PRP_DECODE_BAD on a dead row.
+  // ==========================================================================
+  pub let prp_row_fetch_rights : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_row_fetch_rights: fetch_rights at [+8]. Labels prefixed kpr_rf_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call prp_tail_valid;
+        cmp rax, 0;
+        je  kpr_rf_bad;
+        lea r10, [rip + _prp_table];
+        mov r11, r12;
+        shl r11, 5;
+        mov rax, r12;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp kpr_rf_out;
+      kpr_rf_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      kpr_rf_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let prp_row_state : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-002 prp_row_state: state byte at header[15:8]. Labels prefixed kpr_rst_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call prp_tail_valid;
+        cmp rax, 0;
+        je  kpr_rst_bad;
+        lea r10, [rip + _prp_table];
+        mov r11, r12;
+        shl r11, 5;
+        mov rax, r12;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp kpr_rst_out;
+      kpr_rst_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      kpr_rst_out:
+        pop r12;
+        ret
+      }
+    }
+}
