@@ -25,14 +25,15 @@ caps_decl   = caps.decl
 # from `module <Basename> = structure { ... }` headers). -----------------
 sources:
   - src/print.pdx                 # sys_write(fd=1) helper
+  - src/audit_wire.pdx            # libpdx-audit wire helper (M3-003)
   - src/kind_package_manifest.pdx # KIND_PACKAGE_MANIFEST = 0x193 (M2-001)
   - src/kind_package_repo.pdx     # KIND_PACKAGE_REPO     = 0x192 (M2-002)
   - src/manifest_codec.pdx        # manifest.pdxsig decoder + verify seams (M2-003)
-  - src/txn_client.pdx            # KIND_PDXFS_TXN userspace wrappers (M2-003)
-  - src/install.pdx               # `pkg install <name>` body (M2-003)
-  - src/remove.pdx                # `pkg remove <name>` body + undo (M2-004)
-  - src/subcommands_m1_stubs.pdx  # install / remove / verify / keys stubs
-  - src/list.pdx                  # `pkg list` body (M1: header + placeholder)
+  - src/txn_client.pdx            # KIND_PDXFS_TXN userspace wrappers (M3 real syscall)
+  - src/install.pdx               # `pkg install <name>` body (M2-003 + M3-003 audit)
+  - src/remove.pdx                # `pkg remove <name>` body + undo (M2-004 + M3-003 audit)
+  - src/subcommands_m1_stubs.pdx  # verify / keys stubs (M3-003 audit)
+  - src/list.pdx                  # `pkg list` body (M1 + M3-003 audit)
   - src/dispatch.pdx              # subcommand recognizer + routing
   - src/main.pdx                  # pkg_main(argc, argv) entry point
 
@@ -44,6 +45,7 @@ sources:
 # libpdx-cap.M2 lands the CAP_MANIFEST_MISSING / EXTRA logic.
 deps:
   - libpdx-argv @ ^0.1
+  - libpdx-audit @ ^0.2      # M3-003: pre-output journal on every subcommand
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49 tool observes and every M1 file

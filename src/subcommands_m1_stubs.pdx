@@ -69,17 +69,38 @@ module PkgSubcommandsM1 = structure {
   // ============================================================================
   // pkg_verify_stub() -> 3
   // ============================================================================
-  pub let pkg_verify_stub : () -> u64 !{mem, sysreg} @{} =
+  pub let pkg_verify_stub : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {},
-      justification: "pkg.M1-002 pkg_verify_stub. Same shape as pkg_install_stub with VERIFY_STUB_MSG. M2's pkg_verify body replaces the body; signature stays.",
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.M3-003 pkg_verify_stub. Same audit-first discipline as pkg_list_body / pkg_install_body / pkg_remove_body -- audit_begin_op before any stdout emission; on broker unavailable refuse without output; audit_commit_op at exit. 2-push prologue (rbx unused body-side, r12=audit_id) keeps rsp%16 == 0 for the nested calls. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient. Body still prints VERIFY_STUB_MSG + returns 3.",
       block: {
         push rbx;
+        push r12;
+
+        lea rdi, [rip + AuditWire::OP_NAME_VERIFY];
+        xor rsi, rsi;
+        call AuditWire::audit_begin_op;
+        cmp rax, 0;
+        je  pv_broker_fail;
+        mov r12, rax;
+
         lea rdi, [rip + VERIFY_STUB_MSG];
         mov rsi, 51;                            // VERIFY_STUB_MSG_LEN
         call Print::print_str;
-        pop rbx;
+
+        mov rdi, r12;
+        mov rsi, 3;                             // exit_code = 3 (not-yet-impl)
+        call AuditWire::audit_commit_op;
+
         mov rax, 3;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pv_broker_fail:
+        mov rax, 3;                             // AUDIT_EXIT_BROKER_FAIL
+        pop r12;
+        pop rbx;
         ret
       }
     }
@@ -87,17 +108,38 @@ module PkgSubcommandsM1 = structure {
   // ============================================================================
   // pkg_keys_stub() -> 3
   // ============================================================================
-  pub let pkg_keys_stub : () -> u64 !{mem, sysreg} @{} =
+  pub let pkg_keys_stub : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {},
-      justification: "pkg.M1-002 pkg_keys_stub. Same shape as pkg_install_stub with KEYS_STUB_MSG. M5's pkg_keys body (fingerprint listing off the paideia_root_pk documentation) replaces the body; signature stays.",
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.M3-003 pkg_keys_stub. Mirror of pkg_verify_stub with OP_NAME_KEYS and KEYS_STUB_MSG.",
       block: {
         push rbx;
+        push r12;
+
+        lea rdi, [rip + AuditWire::OP_NAME_KEYS];
+        xor rsi, rsi;
+        call AuditWire::audit_begin_op;
+        cmp rax, 0;
+        je  pk_broker_fail;
+        mov r12, rax;
+
         lea rdi, [rip + KEYS_STUB_MSG];
         mov rsi, 49;                            // KEYS_STUB_MSG_LEN
         call Print::print_str;
-        pop rbx;
+
+        mov rdi, r12;
+        mov rsi, 3;                             // exit_code = 3
+        call AuditWire::audit_commit_op;
+
         mov rax, 3;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pk_broker_fail:
+        mov rax, 3;
+        pop r12;
+        pop rbx;
         ret
       }
     }

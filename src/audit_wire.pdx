@@ -1,0 +1,172 @@
+// src/audit_wire.pdx -- pkg.M3-003 (#11)
+// AuditWire module: one place for every audit_begin / audit_record_output
+// / audit_commit sequence pkg's five subcommands need.
+//
+// Scope
+// -----
+// r49-r50-plan.md §5.1 M3 line "libpdx-audit: pre-output journal on
+// every subcommand." I5 upgrade in design/tooling/plan.md: every
+// operation is discoverable -- a supervisor reading /system/audit/
+// user-events/ sees a UEJ_KIND_TOOL_INVOKE record BEFORE any user-
+// visible byte lands on stdout / stderr. This module keeps the invoke
+// / output / exit sequence discipline factored out of the five
+// subcommand bodies so the wire pattern is one edit if the audit ABI
+// widens (which it will at M4 when the audit-broker daemon body
+// lands).
+//
+// Wire pattern per subcommand body:
+//
+//   audit_id = AuditWire::audit_begin_op(OP_NAME_PTR, OP_ARGS_PTR)
+//   if audit_id == 0: exit 3 (I4 discipline -- broker unavailable
+//                             refuses tool output rather than
+//                             emitting un-journalled bytes).
+//   ... (subcommand body -- output emission) ...
+//   AuditWire::audit_record_op_output(audit_id, SCHEMA_HASH_PTR)
+//       (optional; skip for text-only subcommands)
+//   ... (subcommand body -- more output) ...
+//   AuditWire::audit_commit_op(audit_id, exit_code)
+//   return exit_code
+//
+// AuditClient's own gates (state-machine + id-match) enforce that a
+// caller cannot skip audit_begin and go straight to audit_commit; a
+// broker-unavailable audit_begin returns 0 and the caller MUST exit 3
+// to keep I5 intact. This wrapper module documents that contract with
+// the AUDIT_EXIT_BROKER_FAIL constant so the return path is visually
+// distinct at every caller.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module AuditWire (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg,imm <= 0x7FFFFFFF.
+//   - r11 scratch.
+//   - Leaf w.r.t. its own frame -- delegates to AuditClient::*.
+
+module AuditWire = structure {
+
+  // ---- Op-name .rodata strings (NUL-terminated) -----------------------
+  // One per subcommand vocabulary entry from the M1 argv surface.
+  // Each is what a supervisor reading the UEJ payload will render as
+  // the "op_name" column; keep them stable across milestones because
+  // the audit stream is a public interface consumers filter on.
+  pub let OP_NAME_LIST    : [u8; 5] = "list\0"
+  pub let OP_NAME_INSTALL : [u8; 8] = "install\0"
+  pub let OP_NAME_REMOVE  : [u8; 7] = "remove\0"
+  pub let OP_NAME_VERIFY  : [u8; 7] = "verify\0"
+  pub let OP_NAME_KEYS    : [u8; 5] = "keys\0"
+
+  // ---- Exit code the caller MUST use on audit-broker unavailable ------
+  // Matches PkgSubcommandsM1::EXIT_NOT_YET_IMPLEMENTED semantically
+  // (a third distinct code from EXIT_OP_FAIL and EXIT_USAGE) but is
+  // named for its actual meaning here: audit refused, no output emitted.
+  pub let AUDIT_EXIT_BROKER_FAIL : u64 = 3
+
+  // ---- Diagnostic string emitted on broker-unavailable ----------------
+  pub let AUDIT_BROKER_MSG : [u8; 66] =
+    "pkg: audit broker unavailable -- refusing output per I5 (M3-003)\n\n"
+  pub let AUDIT_BROKER_MSG_LEN : u64 = 66
+
+  // ==========================================================================
+  // audit_begin_op(op_name_ptr, op_args_ptr) -> audit_id | 0
+  //
+  // Thin delegate around AuditClient::audit_begin. Kept as a distinct
+  // entry point so the five subcommand bodies read as
+  // `call AuditWire::audit_begin_op` -- a name that carries the intent
+  // ("begin the audit for THIS subcommand") rather than exposing the
+  // library API directly at every call site. If the audit fails, this
+  // wrapper prints the broker-unavailable diagnostic on stderr so a
+  // caller does not have to duplicate the diagnostic per subcommand.
+  //
+  // Register plan (2-push callee-save prologue):
+  //   rbx = op_name_ptr (preserved across the print-fallback call)
+  //   r12 = op_args_ptr (preserved for parity; unused body-side after
+  //         the initial audit_begin call).
+  //   rsp%16: entry 8 -> +2 pushes -> 0 for the nested call.
+  // ==========================================================================
+  pub let audit_begin_op : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (op_name_ptr: u64) (op_args_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.M3-003 audit_begin_op: delegate to AuditClient::audit_begin (libpdx-audit M2-001) with a per-subcommand diagnostic fallback. Two callee-save pushes (rbx=op_name_ptr, r12=op_args_ptr) preserve args across the audit_begin call so a caller-side re-read is not needed. On audit_begin returning 0 (broker unavailable / state-gate failure), print AUDIT_BROKER_MSG on stderr and return 0 -- the subcommand body sees the same 0 and exits AUDIT_EXIT_BROKER_FAIL per I5. Effects tail matches AuditClient::audit_begin's !{mem, sysreg} @{cap, sched} (send-path clobber + broker cap + sched wake). Labels prefixed aw_be_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        // Delegate.
+        mov rdi, rbx;
+        mov rsi, r12;
+        call AuditClient::audit_begin;
+        cmp rax, 0;
+        je  aw_be_broker_fail;
+
+        pop r12;
+        pop rbx;
+        ret;
+
+      aw_be_broker_fail:
+        // Diagnostic + return 0. rax is caller's exit signal.
+        lea rdi, [rip + AUDIT_BROKER_MSG];
+        mov rsi, 66;                          // AUDIT_BROKER_MSG_LEN
+        call Print::print_err;
+        xor rax, rax;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // audit_record_op_output(audit_id, schema_hash_ptr) -> AUDIT_OK | *
+  //
+  // Optional per architecture.md §4 of libpdx-audit -- a text-only
+  // subcommand may skip this and go straight to audit_commit. The
+  // schema_hash_ptr is a 32B BLAKE3-truncated schema fingerprint (a
+  // caller-owned pointer into .rodata); passed straight through as
+  // the output_hash u64 lane by way of a synthetic reduction here:
+  // the M3 wire stores the pointer's LOW u64 as the output_hash so a
+  // supervisor scanning the journal can index into a fingerprint
+  // table. M4 upgrades this to a real BLAKE3 of the emitted payload.
+  //
+  // Register plan:
+  //   Leaf w.r.t. its own frame; delegates to AuditClient::
+  //   audit_record_output. rdi (audit_id) + rsi (schema ptr as
+  //   pseudo-schema-ptr) + rdx (schema_hash from ptr low bits).
+  // ==========================================================================
+  pub let audit_record_op_output : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (audit_id: u64) (schema_hash_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.M3-003 audit_record_op_output: delegate to AuditClient::audit_record_output. schema_hash_ptr is passed as BOTH the output_schema ptr (arg2 = rsi) and the output_hash u64 lane (arg3 = rdx = *[schema_hash_ptr] first qword) so an M4 audit consumer can either follow the pointer to render a schema URI OR use the u64 for a fast hash-table probe. Effects tail mirrors AuditClient::audit_record_output. Leaf; no callee-save touched. Labels prefixed aw_ro_.",
+      block: {
+        // Load first qword of the schema hash as the output_hash lane.
+        mov rdx, [rsi];                       // schema_hash u64 from hash blob
+        // rsi already carries schema_hash_ptr (caller passed it as arg2).
+        // rdi already carries audit_id (caller passed it as arg1).
+        call AuditClient::audit_record_output;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // audit_commit_op(audit_id, exit_code) -> AUDIT_OK | *
+  //
+  // Thin delegate around AuditClient::audit_commit. The subcommand
+  // body calls this at every exit path so the audit ledger sees a
+  // matched INVOKE / EXIT pair for every run (including the error
+  // paths where the body did not emit any output between invoke and
+  // exit). Return code is best-effort: a caller that already decided
+  // its exit_code cannot revise it based on a commit failure without
+  // opening a re-entrant loop, so this returns the AuditClient's rc
+  // verbatim and the caller ignores it.
+  // ==========================================================================
+  pub let audit_commit_op : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (audit_id: u64) (exit_code: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.M3-003 audit_commit_op: delegate to AuditClient::audit_commit. Args pass through unchanged (rdi=audit_id, rsi=exit_code). rc verbatim; caller ignores. Effects tail mirrors AuditClient::audit_commit. Leaf. Labels: none.",
+      block: {
+        call AuditClient::audit_commit;
+        ret
+      }
+    }
+}

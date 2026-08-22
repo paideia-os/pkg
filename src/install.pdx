@@ -123,6 +123,14 @@ module PkgInstall = structure {
   // the reply arrives; 0 fails at PXT_MINT_BAD_PARENT in txn_open.
   pub let mut install_parent_slot : u64 = uninit @align(8)
 
+  // M3-003: audit_id allocated by AuditClient::audit_begin at body
+  // entry. Zero until audit_begin_op returns; a body that observes
+  // 0 refused output already (I5). Kept in .bss (rather than a
+  // callee-save register) so both the per-step progress emitters
+  // (M3-002) and the epilogue's audit_commit can read it without
+  // wrestling for r12..r15 which are already spoken for.
+  pub let mut _install_audit_id : u64 = uninit @align(8)
+
   pub let INSTALL_STEP_NONE     : u64 = 0
   pub let INSTALL_STEP_HEADER   : u64 = 1
   pub let INSTALL_STEP_HASH     : u64 = 2
@@ -206,10 +214,10 @@ module PkgInstall = structure {
   // Correction to prologue: five 8-byte pushes flip rsp%16 8 -> 0 which
   // is what the nested calls need. NO pad slot.
   // ==========================================================================
-  pub let pkg_install_body : () -> u64 !{mem, sysreg} @{} =
+  pub let pkg_install_body : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {},
-      justification: "pkg.M2-003 pkg_install_body. Full pipeline: pos_ptrs[1] check -> mc_reset -> mc_read_header (from _install_staging) -> mc_verify_body_hash SEAM -> mc_verify_signatures SEAM -> pmf_cap_mint_inner -> txn_open SEAM -> extract SEAM -> txn_commit SEAM. Two seams (crypto + txn) return *_STUB codes and gate the install with EXIT_OP_FAIL + a diagnostic naming the missing intrinsic -- this is deliberate: a silent skip would violate D4 (dual-signed pillar). On any failure: txn_abort if txn was opened; pmf_cap_revoke if pmf row was minted. Five callee-save pushes (rbx/r12/r13/r14/r15) flip rsp%16 8->0 at every nested call. Every large-imm return code staged via r11. Labels prefixed pi_. Print calls preserve rax across argument shuffle by using r12/r13/r15 for the value lanes.",
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.M3-003 pkg_install_body. M3 upgrade over M2: audit-first (I5) -- AuditWire::audit_begin_op fires BEFORE any output emission or state mutation. On broker unavailable, refuse with AUDIT_EXIT_BROKER_FAIL (3) without emitting any output. On success, audit_id lives in _install_audit_id .bss so the epilogue can commit it without depending on register pressure. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient's own contract. Full pipeline (unchanged shape): pos_ptrs[1] check -> mc_reset -> mc_read_header -> mc_verify_body_hash SEAM -> mc_verify_signatures SEAM -> pmf_cap_mint_inner -> txn_open (real syscall #70) -> extract SEAM -> txn_commit (real cap_invoke). On any failure: txn_abort if txn was opened; pmf_cap_revoke if pmf row was minted. Five callee-save pushes (rbx/r12/r13/r14/r15) flip rsp%16 8->0 at every nested call. Labels prefixed pi_.",
       block: {
         push rbx;
         push r12;
@@ -222,6 +230,24 @@ module PkgInstall = structure {
 
         // Step 0a: reset ManifestCodec state.
         call ManifestCodec::mc_reset;
+
+        // ---- Audit-first (M3-003) --------------------------------------
+        // Fire audit_begin BEFORE any argv check or output emission so
+        // even a usage-error install is journalled (a supervisor grep
+        // for "install foo bar" catches the arity violation without
+        // depending on a parallel stderr scrape).
+        //
+        // op_args defaults to 0; if pos_ptrs[1] is set (arity ok),
+        // we retroactively store it in _install_audit_op_args so a
+        // downstream tool that reads the audit stream sees the target
+        // name. audit_id lands in _install_audit_id.
+        lea rdi, [rip + AuditWire::OP_NAME_INSTALL];
+        xor rsi, rsi;                        // op_args (0 pre-arity-check)
+        call AuditWire::audit_begin_op;
+        cmp rax, 0;
+        je  pi_broker_fail;
+        lea r11, [rip + _install_audit_id];
+        mov [r11], rax;
 
         // Initialise scratch registers.
         xor r13, r13;
@@ -499,7 +525,29 @@ module PkgInstall = structure {
         call KindPackageManifest::pmf_cap_revoke;
 
       pi_ep_return:
+        // ---- M3-003 audit_commit ---------------------------------------
+        // Fire audit_commit_op(audit_id, exit_code) BEFORE the pop
+        // chain so the audit ledger records the actual exit_code the
+        // caller will see. r15 carries exit_code across this call
+        // because audit_commit_op preserves rbx/r12..r15 by SysV.
+        lea r11, [rip + _install_audit_id];
+        mov rdi, [r11];                      // audit_id
+        mov rsi, r15;                        // exit_code
+        call AuditWire::audit_commit_op;
+
         mov rax, r15;                        // exit code
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pi_broker_fail:
+        // I5 refusal: audit broker unavailable, no output was emitted
+        // between audit_begin_op's fallback diagnostic and here. No
+        // audit_commit (audit was never begun). Exit 3.
+        mov rax, 3;                          // AUDIT_EXIT_BROKER_FAIL
         pop r15;
         pop r14;
         pop r13;

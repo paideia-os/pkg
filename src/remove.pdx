@@ -123,6 +123,10 @@ module PkgRemove = structure {
   // (deliberately small; the M4 fixture packages have <= 16 files).
   pub let mut _undo_scratch : [u8; 4160] = uninit @align(64)
 
+  // M3-003: audit_id from AuditClient::audit_begin. See _install_audit_id
+  // in src/install.pdx for the same discipline.
+  pub let mut _remove_audit_id : u64 = uninit @align(8)
+
   // ==========================================================================
   // remove_reset() -> ()
   // ==========================================================================
@@ -232,10 +236,10 @@ module PkgRemove = structure {
   //   r14 = scratch for ManifestCodec-style seam returns
   //   r15 = exit code accumulator
   // ==========================================================================
-  pub let pkg_remove_body : () -> u64 !{mem, sysreg} @{} =
+  pub let pkg_remove_body : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {},
-      justification: "pkg.M2-004 pkg_remove_body. Full pipeline: pos_ptrs[1] check -> monotonic remove_id -> lookup SEAM (no readdir at HEAD) -> txn_open(DELETE) SEAM -> serialise undo header + body (body deferred to M4) -> trash-move SEAM -> txn_commit SEAM. Every seam refuses with EXIT_OP_FAIL + diagnostic; silent-remove would violate I5. Cleanup: txn_abort on any failure. Five callee-save pushes flip rsp%16 8->0. Labels prefixed pr_.",
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.M3-003 pkg_remove_body. M3 upgrade over M2: audit-first via AuditWire::audit_begin_op BEFORE any output. Broker unavailable -> exit 3 without touching stdout/stderr. audit_id lands in _remove_audit_id .bss so epilogue commits without register-pressure hassle. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient. Full pipeline (shape unchanged): pos_ptrs[1] check -> monotonic remove_id -> lookup SEAM (no readdir at HEAD) -> txn_open(DELETE) -> serialise undo header + body -> trash-move SEAM -> txn_commit. Silent-remove-without-audit would violate I5 as well as I5's undo obligation. Cleanup: txn_abort on any failure. Five callee-save pushes flip rsp%16 8->0. Labels prefixed pr_.",
       block: {
         push rbx;
         push r12;
@@ -244,6 +248,15 @@ module PkgRemove = structure {
         push r15;
 
         call remove_reset;
+
+        // ---- Audit-first (M3-003) --------------------------------------
+        lea rdi, [rip + AuditWire::OP_NAME_REMOVE];
+        xor rsi, rsi;                        // op_args (0 pre-arity-check)
+        call AuditWire::audit_begin_op;
+        cmp rax, 0;
+        je  pr_broker_fail;
+        lea r11, [rip + _remove_audit_id];
+        mov [r11], rax;
 
         xor r12, r12;                        // remove_id
         xor r13, r13;                        // TXN slot
@@ -347,7 +360,23 @@ module PkgRemove = structure {
         call TxnClient::txn_abort;
 
       pr_ep_return:
+        // ---- M3-003 audit_commit ---------------------------------------
+        lea r11, [rip + _remove_audit_id];
+        mov rdi, [r11];                      // audit_id
+        mov rsi, r15;                        // exit_code
+        call AuditWire::audit_commit_op;
+
         mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pr_broker_fail:
+        // I5 refusal: no output, no audit_commit; exit 3.
+        mov rax, 3;                          // AUDIT_EXIT_BROKER_FAIL
         pop r15;
         pop r14;
         pop r13;
