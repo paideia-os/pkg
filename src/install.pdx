@@ -183,7 +183,7 @@ module PkgInstall = structure {
         call install_reset;
 
         // Step 0a: reset ManifestCodec state.
-        call mc_reset;
+        call ManifestCodec::mc_reset;
 
         // Initialise scratch registers.
         xor r13, r13;
@@ -239,7 +239,7 @@ module PkgInstall = structure {
         mov [rax], r11;
 
         lea rdi, [rip + _install_staging];
-        call mc_read_header;
+        call ManifestCodec::mc_read_header;
         mov r12, rax;
         lea r11, [rip + install_manifest_rc];
         mov [r11], r12;
@@ -254,10 +254,10 @@ module PkgInstall = structure {
         // body_ptr = staging + 64
         lea rdi, [rip + _install_staging];
         add rdi, 64;
-        // body_len = parsed_body_len
-        lea r11, [rip + parsed_body_len];
+        // body_len = ManifestCodec::parsed_body_len
+        lea r11, [rip + ManifestCodec::parsed_body_len];
         mov rsi, [r11];
-        call mc_verify_body_hash;
+        call ManifestCodec::mc_verify_body_hash;
         mov r12, rax;
         lea r11, [rip + install_manifest_rc];
         mov [r11], r12;
@@ -272,12 +272,12 @@ module PkgInstall = structure {
         lea rdi, [rip + _install_staging];                  // header_ptr
         mov rsi, rdi;
         add rsi, 64;                                        // body_ptr
-        lea r11, [rip + parsed_body_len];
+        lea r11, [rip + ManifestCodec::parsed_body_len];
         mov rdx, [r11];                                     // body_len
         // sigblock_ptr = header + 64 + body_len
         mov rcx, rsi;
         add rcx, rdx;
-        call mc_verify_signatures;
+        call ManifestCodec::mc_verify_signatures;
         mov r12, rax;
         lea r11, [rip + install_manifest_rc];
         mov [r11], r12;
@@ -293,15 +293,15 @@ module PkgInstall = structure {
         // seeded for the staging read yet), author_fpr halves + root_fpr
         // halves from ParsedManifest.
         mov rdi, 0;                          // pdxfs_row_id (M2 stub)
-        lea r11, [rip + parsed_author_fpr_lo];
+        lea r11, [rip + ManifestCodec::parsed_author_fpr_lo];
         mov rsi, [r11];
-        lea r11, [rip + parsed_author_fpr_hi];
+        lea r11, [rip + ManifestCodec::parsed_author_fpr_hi];
         mov rdx, [r11];
-        lea r11, [rip + parsed_root_fpr_lo];
+        lea r11, [rip + ManifestCodec::parsed_root_fpr_lo];
         mov rcx, [r11];
-        lea r11, [rip + parsed_root_fpr_hi];
+        lea r11, [rip + ManifestCodec::parsed_root_fpr_hi];
         mov r8,  [r11];
-        call pmf_cap_mint_inner;
+        call KindPackageManifest::pmf_cap_mint_inner;
         // A successful return is 0..PMF_MAX-1 (0..7); anything at
         // 0xFFFFEC3* is a refusal.
         mov r13, rax;
@@ -320,7 +320,7 @@ module PkgInstall = structure {
         mov rdi, 1;                          // TXN_MODE_CREATE
         xor rsi, rsi;                        // snap_gen (stub)
         xor rdx, rdx;                        // wal_off (stub)
-        call txn_open;
+        call TxnClient::txn_open;
         mov r14, rax;
         lea r11, [rip + install_txn_slot];
         mov [r11], r14;
@@ -342,7 +342,7 @@ module PkgInstall = structure {
         mov [rax], r11;
 
         mov rdi, r14;                        // slot
-        call txn_commit;
+        call TxnClient::txn_commit;
         mov r11, 0xFFFFEA00;
         cmp rax, r11;
         jae pi_err_txn;
@@ -406,7 +406,7 @@ module PkgInstall = structure {
         cmp r15, 0;
         je  pi_ep_check_pmf;
         mov rdi, r14;
-        call txn_abort;
+        call TxnClient::txn_abort;
 
       pi_ep_check_pmf:
         // If we minted a pmf row AND we bailed, revoke it.
@@ -416,7 +416,7 @@ module PkgInstall = structure {
         cmp r15, 0;
         je  pi_ep_return;
         mov rdi, r13;
-        call pmf_cap_revoke;
+        call KindPackageManifest::pmf_cap_revoke;
 
       pi_ep_return:
         mov rax, r15;                        // exit code
