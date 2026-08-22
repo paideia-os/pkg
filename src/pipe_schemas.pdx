@@ -1,0 +1,381 @@
+// src/pipe_schemas.pdx -- pkg.M3-001 (#9) + M3-002 (#10)
+// PipeSchemas module: schema-hash constants + fd-1 binders + record
+// emit helpers for pkg's two typed stdout streams.
+//
+// Scope
+// -----
+// r49-r50-plan.md §5.1 M3 line "semantic-pipe: PackageManifest[]
+// schema bind + emit on pkg list" and "InstallProgressRecord[] per
+// install stage". D2 in design/tooling/plan.md: every tool emits both
+// text and typed-schema records on its stdout; downstream consumers
+// filter/sort by schema field, not by column-slicing text.
+//
+// Schemas
+// -------
+// Two schemas are declared here at M3, both under a 32-byte BLAKE3-
+// truncated schema-hash discipline. M3 uses a stable-but-placeholder
+// hash blob (a NUL-padded human-readable identifier) rather than a
+// live BLAKE3 of the schema definition -- the wire semantics are
+// unchanged (semantic-pipe treats the hash as an opaque 32-byte
+// binding key) and M4 upgrades the hash blobs to real BLAKE3 outputs
+// once the schema-definition files land alongside the pkg .pdxdoc
+// bundle.
+//
+//   PackageManifest         -- one row per installed package. Body:
+//                              [+0]  8B name_len (u64)
+//                              [+8]  name_len bytes (name, no NUL)
+//                              -- variable length; capped at 4056
+//                              (SP_MAX_RECORD_BODY).
+//
+//   InstallProgressRecord   -- one row per install-pipeline step.
+//                              Body:
+//                              [+0]  8B step_id     (u64; see
+//                                    INSTALL_STEP_* in install.pdx)
+//                              [+8]  8B rc          (u64; MC_* /
+//                                    TXN_* / PMF_* code; 0 == OK)
+//                              -- fixed 16 bytes.
+//
+// One-in-flight-per-process composition buffer discipline (matches
+// libpdx-semantic-pipe's own _send_hdr_buf / _send_payload_buf). The
+// bodies below serialise into module-local scratch buffers, then call
+// Send::send_record which composes the R20b frame + issues the syscall.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module PipeSchemas (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg,imm <= 0x7FFFFFFF.
+//   - r11 scratch.
+//   - Byte reads via xor rax,rax; mov_b rax,[ptr] per #1248.
+
+module PipeSchemas = structure {
+
+  // ---- Standard fd for stdout (matches Print::FD_STDOUT) --------------
+  pub let PS_FD_STDOUT : u64 = 1
+
+  // ---- Return codes ---------------------------------------------------
+  pub let PS_OK               : u64 = 0
+  pub let PS_ERR_ALREADY_BOUND : u64 = 0xFFFFEB90
+  pub let PS_ERR_BIND_FAIL     : u64 = 0xFFFFEB91
+  pub let PS_ERR_SEND_FAIL     : u64 = 0xFFFFEB92
+  pub let PS_ERR_NAME_TOO_LONG : u64 = 0xFFFFEB93
+
+  // ---- Schema-hash blobs ----------------------------------------------
+  // 32 bytes each, NUL-padded from a human-readable identifier so a
+  // supervisor grep on /system/audit/user-events/ can identify the
+  // schema by inspection while M4 has not yet regenerated real BLAKE3
+  // hashes.
+  //
+  //   "pdxsig.pkg.pmf.v1"  = 17 chars + 15 NUL pad  = 32
+  //   "pdxsig.pkg.ipr.v1"  = 17 chars + 15 NUL pad  = 32
+  //
+  // The 32-byte length is invariant: libpdx-semantic-pipe's Binding
+  // module reads exactly SP_SCHEMA_HASH_SIZE (32) bytes at bind time
+  // and lookup_schema copies the same 32 bytes into the payload
+  // hash-prefix at send time.
+  pub let PACKAGE_MANIFEST_HASH : [u8; 32] =
+    "pdxsig.pkg.pmf.v1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+
+  pub let INSTALL_PROGRESS_HASH : [u8; 32] =
+    "pdxsig.pkg.ipr.v1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+
+  // ---- Composition scratch --------------------------------------------
+  // One PackageManifest record: 8B name_len + up to 4048 bytes name.
+  // Cap the name at 256 bytes -- a realistic package name is <= 64
+  // and 256 leaves plenty of headroom for a scoped identifier like
+  // "org.paideia.pkg.pkg-cli-1.0.0". Total scratch = 8 + 256 = 264
+  // bytes.
+  pub let PS_PMF_NAME_MAX  : u64 = 256
+  pub let PS_PMF_BODY_MAX  : u64 = 264
+  pub let mut _pmf_scratch : [u8; 264] = uninit @align(8)
+
+  // One InstallProgressRecord: 8B step_id + 8B rc = 16 bytes.
+  pub let PS_IPR_BODY_LEN  : u64 = 16
+  pub let mut _ipr_scratch : [u8; 16]  = uninit @align(8)
+
+  // ---- .bss binding flags ---------------------------------------------
+  // Set the first time a bind-* is called so a follow-up call skips
+  // the re-bind (libpdx-semantic-pipe Binding refuses SP_ERR_ALREADY_
+  // BOUND on a second bind to the same fd with a different hash; we
+  // dodge that by tracking the bind state per-schema here).
+  pub let mut _pmf_bound : u64 = uninit @align(8)
+  pub let mut _ipr_bound : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // ps_reset() -> ()
+  //
+  // Zero the two bind flags so a subsequent process (or an M4 test
+  // harness) starts from a known baseline. Not called on the hot path;
+  // pkg_main invokes it once at startup for parity with every other
+  // reset entry in this repo (dispatch_reset, install_reset, etc).
+  // ==========================================================================
+  pub let ps_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M3-001 ps_reset: zero _pmf_bound + _ipr_bound so a subsequent bind fires the underlying libpdx-semantic-pipe bind call. Leaf function; r11 scratch. Labels: none.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + _pmf_bound]; mov [r11], rax;
+        lea r11, [rip + _ipr_bound]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ps_bind_pkg_manifest() -> PS_OK | PS_ERR_BIND_FAIL
+  //
+  // Idempotent bind of stdout to the PackageManifest schema hash. On
+  // first call, invokes libpdx_semantic_pipe_bind(1, &PACKAGE_MANIFEST_
+  // HASH); on subsequent calls (within the same process), a fast-path
+  // returns PS_OK without re-invoking the bind. This matters because
+  // the underlying Binding module refuses SP_ERR_ALREADY_BOUND on a
+  // duplicate bind against a different hash -- a duplicate against the
+  // SAME hash also refuses, but the caller here has no way to
+  // discriminate the two, so the fast-path avoids the ambiguity.
+  //
+  // Register plan:
+  //   Leaf; 1-push callee-save (rbx unused body-side but preserves
+  //   rsp%16 == 0 for the nested Binding call).
+  // ==========================================================================
+  pub let ps_bind_pkg_manifest : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M3-001 ps_bind_pkg_manifest: idempotent bind on the PackageManifest schema hash. Fast-path: if _pmf_bound != 0 return PS_OK. Slow-path: Binding::libpdx_semantic_pipe_bind(1, &PACKAGE_MANIFEST_HASH). On SP_OK (0) set _pmf_bound = 1 and return PS_OK; on any other rc return PS_ERR_BIND_FAIL (large-imm staged via r11 for the return-code compare). 1 push (rbx) keeps rsp%16 == 0 for the nested bind call. sysreg effect declared for parity with the send path (bind itself does not syscall but the tail-call chain does). Labels prefixed ps_bpm_.",
+      block: {
+        push rbx;
+
+        // Fast-path.
+        lea r11, [rip + _pmf_bound];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne ps_bpm_already;
+
+        // Slow-path: bind fd=1 to PackageManifest schema hash.
+        mov rdi, 1;                              // PS_FD_STDOUT
+        lea rsi, [rip + PACKAGE_MANIFEST_HASH];
+        call Binding::libpdx_semantic_pipe_bind;
+        cmp rax, 0;                              // SP_OK
+        jne ps_bpm_fail;
+
+        // Mark bound.
+        mov rax, 1;
+        lea r11, [rip + _pmf_bound];
+        mov [r11], rax;
+
+      ps_bpm_already:
+        xor rax, rax;                            // PS_OK
+        pop rbx;
+        ret;
+
+      ps_bpm_fail:
+        mov rax, 0xFFFFEB91;                     // PS_ERR_BIND_FAIL
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ps_bind_install_progress() -> PS_OK | PS_ERR_BIND_FAIL
+  //
+  // Mirror of ps_bind_pkg_manifest against INSTALL_PROGRESS_HASH.
+  // Independent bind flag because pkg_install and pkg_list are
+  // distinct subcommand bodies in the same process -- a shell that
+  // pipes `pkg list | ... | pkg install` would re-invoke pkg but per-
+  // process isolation makes that a fresh binding anyway.
+  // ==========================================================================
+  pub let ps_bind_install_progress : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M3-002 ps_bind_install_progress: idempotent bind on the InstallProgressRecord schema hash. Same shape as ps_bind_pkg_manifest. Labels prefixed ps_bip_.",
+      block: {
+        push rbx;
+
+        lea r11, [rip + _ipr_bound];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne ps_bip_already;
+
+        mov rdi, 1;
+        lea rsi, [rip + INSTALL_PROGRESS_HASH];
+        call Binding::libpdx_semantic_pipe_bind;
+        cmp rax, 0;
+        jne ps_bip_fail;
+
+        mov rax, 1;
+        lea r11, [rip + _ipr_bound];
+        mov [r11], rax;
+
+      ps_bip_already:
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      ps_bip_fail:
+        mov rax, 0xFFFFEB91;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ps_emit_pkg_manifest(name_ptr, name_len) -> PS_OK | PS_ERR_*
+  //
+  // Serialise one PackageManifest record into _pmf_scratch:
+  //
+  //   qword @0        : name_len (u64)
+  //   bytes [8..8+n)  : name (no NUL)
+  //
+  // Then call Send::send_record(1, &_pmf_scratch, 8 + name_len).
+  //
+  // Gates:
+  //   name_ptr == 0                     -> PS_ERR_NAME_TOO_LONG (reused
+  //                                        sentinel; a null name is a
+  //                                        caller bug at this seam)
+  //   name_len > PS_PMF_NAME_MAX        -> PS_ERR_NAME_TOO_LONG
+  //   Send::send_record != SP_SEND_OK   -> PS_ERR_SEND_FAIL
+  //
+  // Register plan (3-push callee-save prologue):
+  //   rbx = name_ptr    (survives the byte-copy loop's rax/rcx clobber)
+  //   r12 = name_len    (survives + is the count for the copy loop)
+  //   r13 = &_pmf_scratch (once)
+  //   Entry rsp%16 == 8; 3 pushes -> rsp%16 == 8; sub rsp,8 pad ->
+  //   rsp%16 == 0 for nested calls.
+  // ==========================================================================
+  pub let ps_emit_pkg_manifest : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "pkg.M3-001 ps_emit_pkg_manifest: compose + send one PackageManifest record. Gates: name_ptr != 0, name_len <= PS_PMF_NAME_MAX (256). Serialisation: qword[0] = name_len, bytes [8..8+n) = name copied byte-by-byte via xor rax,rax + mov_b (paideia-as #1248). Then Send::send_record(1, &_pmf_scratch, 8+name_len). 3 callee-save pushes + sub rsp,8 pad = 32 bytes; rsp%16 was 8 on entry (SysV) -> post-prologue == 0 for the send_record call. sysreg + @cap tail matches Send::send_record. Send failure surfaces as PS_ERR_SEND_FAIL (large-imm staged via r11 in the compare). Labels prefixed ps_ep_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 8;                              // pad -> rsp%16 == 0
+
+        mov rbx, rdi;                            // name_ptr
+        mov r12, rsi;                            // name_len
+
+        // Gate: name_ptr non-null.
+        cmp rbx, 0;
+        je  ps_ep_bad_name;
+
+        // Gate: name_len <= 256.
+        cmp r12, 256;                            // PS_PMF_NAME_MAX
+        ja  ps_ep_bad_name;
+
+        lea r13, [rip + _pmf_scratch];
+
+        // Write name_len at scratch[0].
+        mov [r13 + 0], r12;
+
+        // Copy name bytes to scratch[8..8+n). rcx = index in [0, n).
+        xor rcx, rcx;
+      ps_ep_copy_head:
+        cmp rcx, r12;
+        jae ps_ep_copy_done;
+
+        // dst = _pmf_scratch + 8 + rcx
+        mov r8, r13;
+        add r8, 8;
+        add r8, rcx;
+
+        // src = name_ptr + rcx
+        mov r9, rbx;
+        add r9, rcx;
+
+        xor rax, rax;
+        mov_b rax, [r9];
+        mov_b [r8], rax;
+
+        add rcx, 1;
+        jmp ps_ep_copy_head;
+
+      ps_ep_copy_done:
+        // send_record(fd=1, rec_ptr=&_pmf_scratch, rec_len=8+name_len)
+        mov rdi, 1;                              // PS_FD_STDOUT
+        mov rsi, r13;                            // &_pmf_scratch
+        mov rdx, r12;
+        add rdx, 8;                              // rec_len = 8 + name_len
+        call Send::send_record;
+        cmp rax, 0;                              // SP_SEND_OK
+        jne ps_ep_send_fail;
+
+        xor rax, rax;                            // PS_OK
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ps_ep_bad_name:
+        mov rax, 0xFFFFEB93;                     // PS_ERR_NAME_TOO_LONG
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ps_ep_send_fail:
+        mov rax, 0xFFFFEB92;                     // PS_ERR_SEND_FAIL
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ps_emit_install_progress(step_id, rc) -> PS_OK | PS_ERR_SEND_FAIL
+  //
+  // Serialise one InstallProgressRecord into _ipr_scratch:
+  //
+  //   qword @0 : step_id (u64)
+  //   qword @8 : rc      (u64)
+  //
+  // Then call Send::send_record(1, &_ipr_scratch, 16).
+  //
+  // Register plan (2-push callee-save):
+  //   rbx = step_id (unused after store)
+  //   r12 = rc      (unused after store)
+  //   Entry rsp%16 == 8; 2 pushes -> rsp%16 == 8; sub rsp,8 pad ->
+  //   rsp%16 == 0.
+  // ==========================================================================
+  pub let ps_emit_install_progress : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (step_id: u64) (rc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "pkg.M3-002 ps_emit_install_progress: compose + send one InstallProgressRecord (16B fixed body = step_id | rc). Serialisation: qword[0] = step_id, qword[8] = rc. Then Send::send_record(1, &_ipr_scratch, 16). 2 callee-save pushes + sub rsp,8 pad = 24; entry rsp%16 == 8 -> post-prologue == 0. Send failure surfaces as PS_ERR_SEND_FAIL. Labels prefixed ps_ei_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // step_id
+        mov r12, rsi;                            // rc
+
+        lea r11, [rip + _ipr_scratch];
+        mov [r11 + 0], rbx;
+        mov [r11 + 8], r12;
+
+        // send_record(1, &_ipr_scratch, 16).
+        mov rdi, 1;                              // PS_FD_STDOUT
+        lea rsi, [rip + _ipr_scratch];
+        mov rdx, 16;                             // PS_IPR_BODY_LEN
+        call Send::send_record;
+        cmp rax, 0;
+        jne ps_ei_send_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ps_ei_send_fail:
+        mov rax, 0xFFFFEB92;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

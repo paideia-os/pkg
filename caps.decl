@@ -55,7 +55,8 @@ requires:
 # pkg_install and pkg_remove, which are M2 bodies).
 
 # Declared output schemas — the semantic-pipe schema records this tool
-# emits on its stdout. M1 emits none (list prints text lines only). M3
-# introduces PackageManifest[], InstallProgressRecord[], and
-# KeyFingerprintRecord[] via libpdx-semantic-pipe.
-declares_output_schemas: (none)
+# emits on its stdout. M3-001 wires PackageManifest[] on pkg list;
+# M3-002 wires InstallProgressRecord[] on pkg install; M4 wires
+# KeyFingerprintRecord[] on pkg keys list.
+declares_output_schemas:
+  - PackageManifest        # pdxsig.pkg.pmf.v1 -- emitted by `pkg list` (M3-001)

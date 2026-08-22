@@ -47,6 +47,21 @@ module PkgList = structure {
     "  (none — pkg list wires to /system/packages/ readdir at M2)\n"
   pub let LIST_PLACEHOLDER_LEN : u64 = 62
 
+  // M3-001: demo package name emitted as a PackageManifest[] record so
+  // a downstream consumer scanning for the schema hash sees at least
+  // one row on `pkg list`. The name matches the self-install bootstrap
+  // (pkg.M2-005) so a caller reading both the M3 record stream and
+  // the M2 self-install log sees the same identifier.
+  pub let LIST_DEMO_PKG_NAME     : [u8; 3] = "pkg"
+  pub let LIST_DEMO_PKG_NAME_LEN : u64     = 3
+
+  // M3-001 diagnostic emitted after the record stream when the schema
+  // bind fails -- a supervisor grep sees the record stream broken by
+  // the diagnostic rather than a silent gap.
+  pub let LIST_SCHEMA_BIND_FAIL : [u8; 64] =
+    "pkg list: PackageManifest schema bind failed (see errno on rc)\n\n"
+  pub let LIST_SCHEMA_BIND_FAIL_LEN : u64 = 64
+
   // -- M1 enumeration state (stub) --------------------------------------
   // pkg_list_enumerate populates enumerated_count with the number of
   // installed packages. At M1 the enumerator is a stub that leaves the
@@ -168,6 +183,38 @@ module PkgList = structure {
         lea rdi, [rip + LIST_HEADER];
         mov rsi, 20;                           // LIST_HEADER_LEN
         call Print::print_str;
+
+        // ---- M3-001: schema bind + PackageManifest[] emit -------------
+        // Bind stdout to PackageManifest schema first; a caller
+        // consuming the schema-typed side of the pipe sees an
+        // established binding before the first record lands. On bind
+        // failure emit a stderr diagnostic + skip the emit; the text
+        // side of the output still renders correctly.
+        call PipeSchemas::ps_bind_pkg_manifest;
+        cmp rax, 0;                            // PS_OK
+        jne pl_bind_fail;
+
+        // Emit ONE demo PackageManifest for "pkg" (matches the M2-005
+        // self-install bootstrap identifier). M3 does not yet enumerate
+        // /system/packages/ -- KIND_PDXFS_FILE.readnext (R42-PREP-008)
+        // exists but pkg has no KIND_MEMORY cap for /system/packages/
+        // seeded via InitCap at M3, so the demo emit is the D2 shape
+        // in place while the enumerator's cap plumbing lands at M4.
+        lea rdi, [rip + LIST_DEMO_PKG_NAME];
+        mov rsi, 3;                            // LIST_DEMO_PKG_NAME_LEN
+        call PipeSchemas::ps_emit_pkg_manifest;
+        // Emit rc ignored -- a downstream schema consumer sees the
+        // record or it does not; the text side (header + placeholder)
+        // continues either way.
+
+        jmp pl_bind_ok;
+
+      pl_bind_fail:
+        lea rdi, [rip + LIST_SCHEMA_BIND_FAIL];
+        mov rsi, 64;                           // LIST_SCHEMA_BIND_FAIL_LEN
+        call Print::print_err;
+
+      pl_bind_ok:
 
         // Enumerate installed packages. Returns count in rax and also
         // populates enumerated_count. M1: stub always returns 0.
