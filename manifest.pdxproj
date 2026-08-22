@@ -30,6 +30,7 @@ sources:
   - src/manifest_codec.pdx        # manifest.pdxsig decoder + verify seams (M2-003)
   - src/txn_client.pdx            # KIND_PDXFS_TXN userspace wrappers (M2-003)
   - src/install.pdx               # `pkg install <name>` body (M2-003)
+  - src/remove.pdx                # `pkg remove <name>` body + undo (M2-004)
   - src/subcommands_m1_stubs.pdx  # install / remove / verify / keys stubs
   - src/list.pdx                  # `pkg list` body (M1: header + placeholder)
   - src/dispatch.pdx              # subcommand recognizer + routing

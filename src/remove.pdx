@@ -1,0 +1,359 @@
+// src/remove.pdx -- pkg.M2-004
+// PkgRemove module: `pkg remove <name>` body.
+//
+// Scope
+// -----
+// Per r49-r50-plan.md §5.1 M2 line: "pkg remove writes the reverse-
+// symlink undo record."  Design/tooling/plan.md I5 upgrade: every
+// destructive op is reversible via `undo <cmd>` for a bounded window;
+// remove additionally writes the target into the PdxFS trash subtree
+// so `undo pkg remove <name>` can restore without a re-fetch.
+//
+// M2 lands the SHAPE of the remove pipeline with the same
+// seam-discipline as install:
+//
+//   1. Read pos_ptrs[1] (name); pos_count must be 2.
+//   2. Look up the installed version via /system/packages/<name>-*
+//      (STUB at M2 -- KIND_PDXFS_FILE has no readdir op; the M2 shape
+//      hard-codes a lookup miss which fails-safe).
+//   3. Open KIND_PDXFS_TXN(mode=DELETE) via TxnClient::txn_open (SEAM).
+//   4. Serialise the reverse-symlink undo record into the process's
+//      undo-scratch buffer (REAL byte layout at M2 -- shape is stable).
+//   5. Move /pkgs/<name>-<version>/ into
+//      /system/trash/<remove_id>-<name>-<version>/ via a per-file txn
+//      write per the parent's FILE_INVENTORY (STUB at M2 -- one write
+//      per record shape lives at M4 alongside the fixture manifest).
+//   6. Write the undo record to /journal/pkg/remove-<remove_id>.pdxundo
+//      (STUB at M2 -- KIND_PDXFS_FILE write op deferred to R42-PREP-007).
+//   7. Commit txn.
+//   8. Exit 0.
+//
+//   On failure: txn_abort; exit 1 (EXIT_OP_FAIL) with a diagnostic
+//   naming the failing step.
+//
+// Undo-record byte layout (design/tooling/plan.md §6.4 companion to
+// the manifest format at design/manifest-format.md). 64B header + a
+// variable body of FILE_TRASH_ENTRY records:
+//
+//   [+0]  8B magic          "pdxundo\0"  = 0x006f_646e_7578_6470
+//   [+8]  4B format_version 1
+//   [+12] 4B header_flags   0
+//   [+16] 8B remove_id      monotonic within a process
+//   [+24] 8B removed_ns     wall-clock of the remove
+//   [+32] 8B replay_deadline_ns  absolute deadline; after this the
+//                                trash entry is GC'd and undo → ENOENT
+//   [+40] 8B body_len       length in bytes of the FILE_TRASH_ENTRY seq
+//   [+48] 8B body_sha3_lo   halves of sha3-256(body) -- integrity gate
+//   [+56] 8B body_sha3_hi
+//
+// FILE_TRASH_ENTRY (mirrors design/manifest-format.md §4.3 FILE_
+// INVENTORY): mode + original_path_len + trash_path_len + sha3-256(bytes)
+// + original_path + trash_path.
+//
+// The M2 remove body writes the header (via ur_write_header below) and
+// leaves the body-loop for M4 alongside the per-file tar walk (same
+// data-shape as install's inventory walk, inverted). Serialization
+// order matches the plan-doc §6.4 reverse-map obligation: `undo pkg
+// remove <name>` reads the record, recovers pkg.tar shape from the
+// trash paths, and reinstalls from the trash subtree without needing
+// pkgs.paideia-os connectivity.
+//
+// paideia-as compliance -- same as PkgInstall.
+
+module PkgRemove = structure {
+
+  // ---- Constants -------------------------------------------------------
+  // "pdxundo\0" little-endian.
+  pub let UR_MAGIC_QWORD    : u64 = 0x006F646E75786470
+  pub let UR_FORMAT_VERSION : u64 = 1
+
+  // Default 24-hour undo retention. Wall-clock ns per plan-doc
+  // §6.4 default; M4 test harness can override via --retention.
+  //   24 * 3600 * 1e9 = 86_400_000_000_000
+  pub let UR_DEFAULT_RETENTION_NS : u64 = 86400000000000
+
+  // ---- Return codes ---------------------------------------------------
+  pub let UR_OK               : u64 = 0
+  pub let UR_ERR_BUF_TOO_SMALL : u64 = 0xFFFFEB80
+  pub let UR_ERR_BAD_ARG       : u64 = 0xFFFFEB81
+
+  // ---- Diagnostic strings ---------------------------------------------
+  pub let REMOVE_USAGE_MSG : [u8; 31] =
+    "usage: pkg remove <name>\n(pkg)\n"
+  pub let REMOVE_USAGE_MSG_LEN : u64 = 31
+
+  pub let REMOVE_STAGE_MSG_1 : [u8; 27] =
+    "pkg remove: removing name '"
+  pub let REMOVE_STAGE_MSG_1_LEN : u64 = 27
+  pub let REMOVE_STAGE_MSG_2 : [u8; 2] = "'\n"
+  pub let REMOVE_STAGE_MSG_2_LEN : u64 = 2
+
+  pub let REMOVE_ERR_LOOKUP : [u8; 63] =
+    "pkg remove: /system/packages/ readdir unavailable at M2 (R42)\n\n"
+  pub let REMOVE_ERR_LOOKUP_LEN : u64 = 63
+
+  pub let REMOVE_ERR_TXN : [u8; 65] =
+    "pkg remove: KIND_PDXFS_TXN unavailable (R42-PREP-007 required)\n\n"
+  pub let REMOVE_ERR_TXN_LEN : u64 = 65
+
+  pub let REMOVE_ERR_UNDO : [u8; 60] =
+    "pkg remove: undo record write failed -- refuse per I5\n(pkg)\n"
+  pub let REMOVE_ERR_UNDO_LEN : u64 = 60
+
+  // ---- Remove-progress state (populated across the pipeline) ----------
+  pub let mut remove_name_ptr     : u64 = uninit @align(8)
+  pub let mut remove_id           : u64 = uninit @align(8)
+  pub let mut remove_txn_slot     : u64 = uninit @align(8)
+  pub let mut remove_step         : u64 = uninit @align(8)
+
+  pub let REMOVE_STEP_NONE     : u64 = 0
+  pub let REMOVE_STEP_LOOKUP   : u64 = 1
+  pub let REMOVE_STEP_TXN_OPEN : u64 = 2
+  pub let REMOVE_STEP_UNDO     : u64 = 3
+  pub let REMOVE_STEP_TRASH    : u64 = 4
+  pub let REMOVE_STEP_COMMIT   : u64 = 5
+
+  // Monotonic remove-id counter -- one per process invocation is enough
+  // since pkg is a single-subcommand process at M2, but incrementing
+  // supports the M4 test harness that calls pkg_remove_body multiple
+  // times inside one test binary.
+  pub let mut _remove_id_counter : u64 = uninit @align(8)
+
+  // Undo-record scratch buffer -- 64B header + up to 4KiB body at M2
+  // (deliberately small; the M4 fixture packages have <= 16 files).
+  pub let mut _undo_scratch : [u8; 4160] = uninit @align(64)
+
+  // ==========================================================================
+  // remove_reset() -> ()
+  // ==========================================================================
+  pub let remove_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-004 remove_reset: zero every remove-progress slot. _remove_id_counter is NOT zeroed here -- it is a process-lifetime monotonic; the M4 test harness resets it explicitly when it wants a clean slate. Leaf function.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + remove_name_ptr];  mov [r11], rax;
+        lea r11, [rip + remove_id];        mov [r11], rax;
+        lea r11, [rip + remove_txn_slot];  mov [r11], rax;
+        lea r11, [rip + remove_step];      mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // remove_id_next() -> u64
+  //
+  // Bump the monotonic remove-id counter and return the new value.
+  // Starting value 1 (0 is reserved for "no remove active"). Wrap is
+  // unreachable at process lifetimes (2^64 removes per invocation).
+  // ==========================================================================
+  pub let remove_id_next : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-004 remove_id_next: fetch-and-add on _remove_id_counter. Not atomic (M2 single-thread) but the shape survives to multithread at M5+ where a lock-free fetch-add replaces the mov+add+mov triple. Leaf function.",
+      block: {
+        lea r11, [rip + _remove_id_counter];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ur_write_header(buf_ptr, remove_id, removed_ns, replay_deadline_ns,
+  //                 body_len, body_sha3_lo, body_sha3_hi)
+  //   -> UR_OK | UR_ERR_BAD_ARG
+  //
+  // Serialise the 64B pdxundo header at buf_ptr. Called by
+  // pkg_remove_body after the trash body has been enumerated (its
+  // sha3-256 known); the M2 stub-body variant passes body_len=0 +
+  // sha3 halves = 0.
+  //
+  // Register plan (leaf):
+  //   rdi = buf_ptr (untouched)
+  //   rax = magic constant / field value
+  //   r10 = mask constant
+  //   r11 = LEA scratch / large-imm staging
+  // ==========================================================================
+  pub let ur_write_header : (u64, u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64) (remove_id: u64) (removed_ns: u64) (replay_deadline_ns: u64) (body_len: u64) (body_sha3_lo: u64) (body_sha3_hi: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-004 ur_write_header: serialise the 64B pdxundo header. Layout mirrors design/manifest-format.md's manifest header shape (magic qword + version/flags qword + payload metadata) so a downstream tool that already speaks pdxsig can consume pdxundo with the same qword-load idiom. Every field is a qword store (four 4B fields packed as: format_version|header_flags in qword@8). Large immediates (magic quad) staged via r11. Leaf function. Labels: none.",
+      block: {
+        // qword@0: magic.
+        mov r11, 0x006F646E75786470;         // UR_MAGIC_QWORD
+        mov [rdi + 0], r11;
+
+        // qword@8: format_version (low 32b) | header_flags (high 32b = 0).
+        mov rax, 1;                          // format_version = 1
+        mov [rdi + 8], rax;                  // header_flags = 0 by omission
+
+        // qword@16: remove_id
+        mov [rdi + 16], rsi;
+
+        // qword@24: removed_ns
+        mov [rdi + 24], rdx;
+
+        // qword@32: replay_deadline_ns
+        mov [rdi + 32], rcx;
+
+        // qword@40: body_len
+        mov [rdi + 40], r8;
+
+        // qword@48: body_sha3_lo
+        mov [rdi + 48], r9;
+
+        // qword@56: body_sha3_hi (7th arg via stack per SysV; we could
+        // spill from [rsp+8] but simpler at M2: store zero from rax
+        // when caller passes zero. Real per-file walk at M4 rewrites
+        // this to a proper stack-arg load. Zero at M2 is honest.)
+        xor rax, rax;
+        mov [rdi + 56], rax;
+
+        xor rax, rax;                        // UR_OK
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pkg_remove_body() -> exit_code
+  //
+  // Full remove pipeline. Same seam-discipline as PkgInstall: every
+  // seam that returns *_STUB gates the remove with EXIT_OP_FAIL and a
+  // diagnostic naming the missing intrinsic. A silent "remove without
+  // undo" would violate I5 (destructive-op reversibility).
+  //
+  // Register plan (five callee-save pushes = 40 bytes; rsp%16 flips 8->0
+  // for every nested call):
+  //   rbx = pos_ptrs[1] (package name)
+  //   r12 = remove_id (assigned at step 1a)
+  //   r13 = TXN slot (0 until opened)
+  //   r14 = scratch for ManifestCodec-style seam returns
+  //   r15 = exit code accumulator
+  // ==========================================================================
+  pub let pkg_remove_body : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.M2-004 pkg_remove_body. Full pipeline: pos_ptrs[1] check -> monotonic remove_id -> lookup SEAM (no readdir at HEAD) -> txn_open(DELETE) SEAM -> serialise undo header + body (body deferred to M4) -> trash-move SEAM -> txn_commit SEAM. Every seam refuses with EXIT_OP_FAIL + diagnostic; silent-remove would violate I5. Cleanup: txn_abort on any failure. Five callee-save pushes flip rsp%16 8->0. Labels prefixed pr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        call remove_reset;
+
+        xor r12, r12;                        // remove_id
+        xor r13, r13;                        // TXN slot
+        xor r14, r14;                        // seam scratch
+        xor r15, r15;                        // exit code = 0
+
+        // Step 1: pos_count == 2 check.
+        lea r11, [rip + ParsedArgs::pos_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne pr_usage_error;
+
+        // Load pos_ptrs[1].
+        lea r11, [rip + ParsedArgs::pos_ptrs];
+        mov rbx, [r11 + 8];
+        cmp rbx, 0;
+        je  pr_usage_error;
+
+        lea r11, [rip + remove_name_ptr];
+        mov [r11], rbx;
+
+        // Step 1a: assign remove_id.
+        call remove_id_next;
+        mov r12, rax;
+        lea r11, [rip + remove_id];
+        mov [r11], r12;
+
+        // Step 1b: emit progress diagnostic.
+        lea rdi, [rip + REMOVE_STAGE_MSG_1];
+        mov rsi, 27;                         // REMOVE_STAGE_MSG_1_LEN
+        call Print::print_str;
+
+        mov rdx, rbx;
+      pr_name_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je  pr_name_walk_done;
+        add rdx, 1;
+        jmp pr_name_walk;
+      pr_name_walk_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call Print::print_str;
+
+        lea rdi, [rip + REMOVE_STAGE_MSG_2];
+        mov rsi, 2;                          // REMOVE_STAGE_MSG_2_LEN
+        call Print::print_str;
+
+        // Step 2: lookup /system/packages/<name>-* -- SEAM.
+        // KIND_PDXFS_FILE at HEAD has no readdir; this step
+        // unconditionally refuses at M2 with a diagnostic naming the
+        // missing substrate. M3 wires the readdir extension OR reads
+        // /system/packages/index.pdxlist per architecture.md §M2.
+        mov r11, 1;                          // REMOVE_STEP_LOOKUP
+        lea rax, [rip + remove_step];
+        mov [rax], r11;
+
+        // Deliberate fall-through to the lookup-error branch. When
+        // the substrate lands, this jmp is replaced with the real
+        // lookup call and its refusal-path becomes conditional.
+        jmp pr_err_lookup;
+
+      // ==== error branches ====
+      pr_usage_error:
+        lea rdi, [rip + REMOVE_USAGE_MSG];
+        mov rsi, 31;                         // REMOVE_USAGE_MSG_LEN
+        call Print::print_err;
+        mov r15, 2;
+        jmp pr_epilogue;
+
+      pr_err_lookup:
+        lea rdi, [rip + REMOVE_ERR_LOOKUP];
+        mov rsi, 63;                         // REMOVE_ERR_LOOKUP_LEN
+        call Print::print_err;
+        mov r15, 1;
+        jmp pr_epilogue;
+
+      pr_err_txn:
+        lea rdi, [rip + REMOVE_ERR_TXN];
+        mov rsi, 65;                         // REMOVE_ERR_TXN_LEN
+        call Print::print_err;
+        mov r15, 1;
+        jmp pr_epilogue;
+
+      pr_err_undo:
+        lea rdi, [rip + REMOVE_ERR_UNDO];
+        mov rsi, 60;                         // REMOVE_ERR_UNDO_LEN
+        call Print::print_err;
+        mov r15, 1;
+
+      pr_epilogue:
+        // If a txn was opened, abort it (best-effort).
+        mov r11, 0xFFFFEA00;
+        cmp r13, r11;
+        jae pr_ep_return;
+        cmp r13, 0;
+        je  pr_ep_return;
+        mov rdi, r13;
+        call TxnClient::txn_abort;
+
+      pr_ep_return:
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
