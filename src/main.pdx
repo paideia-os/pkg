@@ -95,12 +95,12 @@ module PkgMain = structure {
         mov r12, rdi;                          // r12 = argc
 
         // Step 1: reset libpdx-argv state.
-        call ParsedArgs::reset;
+        call reset;
 
         // Step 2: parse. rdi = argv, rsi = argc.
         mov rdi, rbx;
         mov rsi, r12;
-        call Parser::parse_argv;
+        call parse_argv;
 
         // Step 3: check parse error. rax == 0 (ERR_OK) → continue.
         cmp rax, 0;
@@ -109,30 +109,30 @@ module PkgMain = structure {
         // Parse failed: print diagnostic, return EXIT_USAGE.
         lea rdi, [rip + PARSE_FAIL_MSG];
         mov rsi, 39;                           // PARSE_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
 
         mov rax, 2;                            // EXIT_USAGE
         jmp pkg_main_epilogue;
 
       pkg_main_parse_ok:
         // Step 4: reset dispatch state.
-        call Dispatch::dispatch_reset;
+        call dispatch_reset;
 
         // Step 5: check pos_count. rax = ParsedArgs::pos_count.
-        lea r11, [rip + ParsedArgs::pos_count];
+        lea r11, [rip + pos_count];
         mov rax, [r11];
         cmp rax, 0;
         jne pkg_main_have_subcmd;
 
         // No subcommand supplied → print usage on stderr, return 2.
-        call Dispatch::dispatch_no_subcommand;
+        call dispatch_no_subcommand;
         jmp pkg_main_epilogue;
 
       pkg_main_have_subcmd:
         // Step 6: dispatch on pos_ptrs[0].
-        lea r11, [rip + ParsedArgs::pos_ptrs];
+        lea r11, [rip + pos_ptrs];
         mov rdi, [r11 + 0];                    // pos_ptrs[0] = subcmd name ptr
-        call Dispatch::dispatch_subcommand;
+        call dispatch_subcommand;
 
       pkg_main_epilogue:
         // Restore stack, return with rax carrying the exit code.

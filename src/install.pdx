@@ -229,7 +229,7 @@ module PkgInstall = structure {
         call install_reset;
 
         // Step 0a: reset ManifestCodec state.
-        call ManifestCodec::mc_reset;
+        call mc_reset;
 
         // ---- Audit-first (M3-003) --------------------------------------
         // Fire audit_begin BEFORE any argv check or output emission so
@@ -241,9 +241,9 @@ module PkgInstall = structure {
         // we retroactively store it in _install_audit_op_args so a
         // downstream tool that reads the audit stream sees the target
         // name. audit_id lands in _install_audit_id.
-        lea rdi, [rip + AuditWire::OP_NAME_INSTALL];
+        lea rdi, [rip + OP_NAME_INSTALL];
         xor rsi, rsi;                        // op_args (0 pre-arity-check)
-        call AuditWire::audit_begin_op;
+        call audit_begin_op;
         cmp rax, 0;
         je  pi_broker_fail;
         lea r11, [rip + _install_audit_id];
@@ -255,7 +255,7 @@ module PkgInstall = structure {
         // text side of the output either way (D2 in design/tooling/plan.md).
         // Bind fires AFTER audit_begin so the bind's syscall is inside
         // the audited window (I5 audit-first). Return code ignored.
-        call PipeSchemas::ps_bind_install_progress;
+        call ps_bind_install_progress;
 
         // Initialise scratch registers.
         xor r13, r13;
@@ -269,13 +269,13 @@ module PkgInstall = structure {
         xor r15, r15;                        // r15 = exit code = 0 (OK)
 
         // Step 1: check pos_count == 2 (subcommand + one positional).
-        lea r11, [rip + ParsedArgs::pos_count];
+        lea r11, [rip + pos_count];
         mov rax, [r11];
         cmp rax, 2;
         jne pi_usage_error;
 
         // Step 1a: load pos_ptrs[1] -> rbx.
-        lea r11, [rip + ParsedArgs::pos_ptrs];
+        lea r11, [rip + pos_ptrs];
         mov rbx, [r11 + 8];                  // pos_ptrs[1]
         cmp rbx, 0;
         je  pi_usage_error;
@@ -288,7 +288,7 @@ module PkgInstall = structure {
         // "we started" even if the pipeline stops at a seam.
         lea rdi, [rip + INSTALL_STAGE_MSG_1];
         mov rsi, 41;                         // INSTALL_STAGE_MSG_1_LEN
-        call Print::print_str;
+        call print_str;
 
         // Print package name -- walk to NUL for length.
         mov rdx, rbx;
@@ -303,11 +303,11 @@ module PkgInstall = structure {
         mov rdi, rbx;
         mov rsi, rdx;
         sub rsi, rbx;
-        call Print::print_str;
+        call print_str;
 
         lea rdi, [rip + INSTALL_STAGE_MSG_2];
         mov rsi, 2;                          // INSTALL_STAGE_MSG_2_LEN
-        call Print::print_str;
+        call print_str;
 
         // Step 3: read header from staging buffer.
         mov r11, 1;                          // INSTALL_STEP_HEADER
@@ -315,7 +315,7 @@ module PkgInstall = structure {
         mov [rax], r11;
 
         lea rdi, [rip + _install_staging];
-        call ManifestCodec::mc_read_header;
+        call mc_read_header;
         mov r12, rax;
         lea r11, [rip + install_manifest_rc];
         mov [r11], r12;
@@ -324,7 +324,7 @@ module PkgInstall = structure {
         // r12 is SysV callee-save so it survives the emit call.
         mov rdi, 1;                          // INSTALL_STEP_HEADER
         mov rsi, r12;
-        call PipeSchemas::ps_emit_install_progress;
+        call ps_emit_install_progress;
 
         cmp r12, 0;                          // MC_OK == 0
         jne pi_err_header;
@@ -338,9 +338,9 @@ module PkgInstall = structure {
         lea rdi, [rip + _install_staging];
         add rdi, 64;
         // body_len = ManifestCodec::parsed_body_len
-        lea r11, [rip + ManifestCodec::parsed_body_len];
+        lea r11, [rip + parsed_body_len];
         mov rsi, [r11];
-        call ManifestCodec::mc_verify_body_hash;
+        call mc_verify_body_hash;
         mov r12, rax;
         lea r11, [rip + install_manifest_rc];
         mov [r11], r12;
@@ -348,7 +348,7 @@ module PkgInstall = structure {
         // M3-002: emit InstallProgressRecord(step=HASH, rc=r12).
         mov rdi, 2;                          // INSTALL_STEP_HASH
         mov rsi, r12;
-        call PipeSchemas::ps_emit_install_progress;
+        call ps_emit_install_progress;
 
         cmp r12, 0;
         jne pi_err_hash;
@@ -361,12 +361,12 @@ module PkgInstall = structure {
         lea rdi, [rip + _install_staging];                  // header_ptr
         mov rsi, rdi;
         add rsi, 64;                                        // body_ptr
-        lea r11, [rip + ManifestCodec::parsed_body_len];
+        lea r11, [rip + parsed_body_len];
         mov rdx, [r11];                                     // body_len
         // sigblock_ptr = header + 64 + body_len
         mov rcx, rsi;
         add rcx, rdx;
-        call ManifestCodec::mc_verify_signatures;
+        call mc_verify_signatures;
         mov r12, rax;
         lea r11, [rip + install_manifest_rc];
         mov [r11], r12;
@@ -374,7 +374,7 @@ module PkgInstall = structure {
         // M3-002: emit InstallProgressRecord(step=VERIFY, rc=r12).
         mov rdi, 3;                          // INSTALL_STEP_VERIFY
         mov rsi, r12;
-        call PipeSchemas::ps_emit_install_progress;
+        call ps_emit_install_progress;
 
         cmp r12, 0;
         jne pi_err_verify;
@@ -388,15 +388,15 @@ module PkgInstall = structure {
         // seeded for the staging read yet), author_fpr halves + root_fpr
         // halves from ParsedManifest.
         mov rdi, 0;                          // pdxfs_row_id (M2 stub)
-        lea r11, [rip + ManifestCodec::parsed_author_fpr_lo];
+        lea r11, [rip + parsed_author_fpr_lo];
         mov rsi, [r11];
-        lea r11, [rip + ManifestCodec::parsed_author_fpr_hi];
+        lea r11, [rip + parsed_author_fpr_hi];
         mov rdx, [r11];
-        lea r11, [rip + ManifestCodec::parsed_root_fpr_lo];
+        lea r11, [rip + parsed_root_fpr_lo];
         mov rcx, [r11];
-        lea r11, [rip + ManifestCodec::parsed_root_fpr_hi];
+        lea r11, [rip + parsed_root_fpr_hi];
         mov r8,  [r11];
-        call KindPackageManifest::pmf_cap_mint_inner;
+        call pmf_cap_mint_inner;
         // A successful return is 0..PMF_MAX-1 (0..7); anything at
         // 0xFFFFEC3* is a refusal.
         mov r13, rax;
@@ -409,7 +409,7 @@ module PkgInstall = structure {
         // r13 is SysV callee-save so it survives the emit call.
         mov rdi, 4;                          // INSTALL_STEP_MINT
         mov rsi, r13;
-        call PipeSchemas::ps_emit_install_progress;
+        call ps_emit_install_progress;
 
         // Cheap disambiguation: refusals are all >= 0xFFFFEC00.
         mov r11, 0xFFFFEC00;
@@ -425,7 +425,7 @@ module PkgInstall = structure {
         // and pi_err_parent renders the operator-facing diagnostic.
         // When libpdx-elevate.M3 lands the reply path this call
         // returns a live slot without further changes at this seam.
-        call PkgElevate::pkg_elevate_request_pdxfs_write_pkgs;
+        call pkg_elevate_request_pdxfs_write_pkgs;
         lea r11, [rip + install_parent_slot];
         mov [r11], rax;                      // 0 today; live slot at M4+
 
@@ -451,7 +451,7 @@ module PkgInstall = structure {
         mov rsi, 1;                          // TXN_MODE_CREATE
         mov rdx, r10;                        // txn_id
         xor rcx, rcx;                        // wal_off
-        call TxnClient::txn_open;
+        call txn_open;
         mov r14, rax;
         lea r11, [rip + install_txn_slot];
         mov [r11], r14;
@@ -462,7 +462,7 @@ module PkgInstall = structure {
         // r14 is SysV callee-save so it survives the emit call.
         mov rdi, 5;                          // INSTALL_STEP_TXN_OPEN
         mov rsi, r14;
-        call PipeSchemas::ps_emit_install_progress;
+        call ps_emit_install_progress;
 
         // Success: rax in [0, 256). Any rax >= 256 is a mint sentinel
         // (0xFFFFEC1x band) or -ENFILE (0xFFFFFFFFFFFFFFDF). PXT_MINT_
@@ -497,7 +497,7 @@ module PkgInstall = structure {
         mov [rax], r11;
 
         mov rdi, r14;                        // slot
-        call TxnClient::txn_commit;
+        call txn_commit;
         // Save commit rc so the emit call (rax-clobbering) does not
         // erase it -- install_manifest_rc is the shared rc lane every
         // stage already writes.
@@ -507,7 +507,7 @@ module PkgInstall = structure {
         // M3-002: emit InstallProgressRecord(step=COMMIT, rc=commit_rc).
         mov rdi, 7;                          // INSTALL_STEP_COMMIT
         mov rsi, rax;                        // rc (moved BEFORE call)
-        call PipeSchemas::ps_emit_install_progress;
+        call ps_emit_install_progress;
 
         // Reload commit rc from install_manifest_rc for the branch.
         lea r11, [rip + install_manifest_rc];
@@ -525,49 +525,49 @@ module PkgInstall = structure {
       pi_usage_error:
         lea rdi, [rip + INSTALL_USAGE_MSG];
         mov rsi, 32;                         // INSTALL_USAGE_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov r15, 2;                          // EXIT_USAGE
         jmp pi_epilogue;
 
       pi_err_header:
         lea rdi, [rip + INSTALL_ERR_HEADER];
         mov rsi, 44;                         // INSTALL_ERR_HEADER_LEN
-        call Print::print_err;
+        call print_err;
         mov r15, 1;                          // EXIT_OP_FAIL
         jmp pi_epilogue;
 
       pi_err_hash:
         lea rdi, [rip + INSTALL_ERR_HASH];
         mov rsi, 78;                         // INSTALL_ERR_HASH_LEN
-        call Print::print_err;
+        call print_err;
         mov r15, 1;
         jmp pi_epilogue;
 
       pi_err_verify:
         lea rdi, [rip + INSTALL_ERR_VERIFY];
         mov rsi, 76;                         // INSTALL_ERR_VERIFY_LEN
-        call Print::print_err;
+        call print_err;
         mov r15, 1;
         jmp pi_epilogue;
 
       pi_err_mint:
         lea rdi, [rip + INSTALL_ERR_MINT];
         mov rsi, 51;                         // INSTALL_ERR_MINT_LEN
-        call Print::print_err;
+        call print_err;
         mov r15, 1;
         jmp pi_epilogue;
 
       pi_err_txn:
         lea rdi, [rip + INSTALL_ERR_TXN];
         mov rsi, 65;                         // INSTALL_ERR_TXN_LEN
-        call Print::print_err;
+        call print_err;
         mov r15, 1;
         jmp pi_epilogue;
 
       pi_err_parent:
         lea rdi, [rip + INSTALL_ERR_PARENT];
         mov rsi, 73;                         // INSTALL_ERR_PARENT_LEN
-        call Print::print_err;
+        call print_err;
         mov r15, 1;
 
       pi_epilogue:
@@ -585,7 +585,7 @@ module PkgInstall = structure {
         cmp r15, 0;
         je  pi_ep_check_pmf;
         mov rdi, r14;
-        call TxnClient::txn_abort;
+        call txn_abort;
 
       pi_ep_check_pmf:
         // If we minted a pmf row AND we bailed, revoke it.
@@ -595,7 +595,7 @@ module PkgInstall = structure {
         cmp r15, 0;
         je  pi_ep_return;
         mov rdi, r13;
-        call KindPackageManifest::pmf_cap_revoke;
+        call pmf_cap_revoke;
 
       pi_ep_return:
         // ---- M3-003 audit_commit ---------------------------------------
@@ -606,7 +606,7 @@ module PkgInstall = structure {
         lea r11, [rip + _install_audit_id];
         mov rdi, [r11];                      // audit_id
         mov rsi, r15;                        // exit_code
-        call AuditWire::audit_commit_op;
+        call audit_commit_op;
 
         mov rax, r15;                        // exit code
         pop r15;

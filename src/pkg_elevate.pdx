@@ -189,7 +189,7 @@ module PkgElevate = structure {
         mov rdi, 1;                          // PE_CAP_MASK_PDXFS_WRITE_PKGS
         lea rdx, [rip + _pe_req_buf];
         lea rcx, [rip + _pe_rep_buf];
-        call ElevateClient::elevate_client_request;
+        call elevate_client_request;
         mov r12, rax;                        // r12 = raw ELVC_ rc
 
         // Persist raw rc for the supervisor bookkeeping.

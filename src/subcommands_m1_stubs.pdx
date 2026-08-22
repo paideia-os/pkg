@@ -77,20 +77,20 @@ module PkgSubcommandsM1 = structure {
         push rbx;
         push r12;
 
-        lea rdi, [rip + AuditWire::OP_NAME_VERIFY];
+        lea rdi, [rip + OP_NAME_VERIFY];
         xor rsi, rsi;
-        call AuditWire::audit_begin_op;
+        call audit_begin_op;
         cmp rax, 0;
         je  pv_broker_fail;
         mov r12, rax;
 
         lea rdi, [rip + VERIFY_STUB_MSG];
         mov rsi, 51;                            // VERIFY_STUB_MSG_LEN
-        call Print::print_str;
+        call print_str;
 
         mov rdi, r12;
         mov rsi, 3;                             // exit_code = 3 (not-yet-impl)
-        call AuditWire::audit_commit_op;
+        call audit_commit_op;
 
         mov rax, 3;
         pop r12;
@@ -116,20 +116,20 @@ module PkgSubcommandsM1 = structure {
         push rbx;
         push r12;
 
-        lea rdi, [rip + AuditWire::OP_NAME_KEYS];
+        lea rdi, [rip + OP_NAME_KEYS];
         xor rsi, rsi;
-        call AuditWire::audit_begin_op;
+        call audit_begin_op;
         cmp rax, 0;
         je  pk_broker_fail;
         mov r12, rax;
 
         lea rdi, [rip + KEYS_STUB_MSG];
         mov rsi, 49;                            // KEYS_STUB_MSG_LEN
-        call Print::print_str;
+        call print_str;
 
         mov rdi, r12;
         mov rsi, 3;                             // exit_code = 3
-        call AuditWire::audit_commit_op;
+        call audit_commit_op;
 
         mov rax, 3;
         pop r12;

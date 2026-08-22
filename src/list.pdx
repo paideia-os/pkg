@@ -166,9 +166,9 @@ module PkgList = structure {
 
         // ---- Audit-first (M3-003) --------------------------------------
         // audit_begin_op(OP_NAME_LIST, 0). Returns audit_id or 0.
-        lea rdi, [rip + AuditWire::OP_NAME_LIST];
+        lea rdi, [rip + OP_NAME_LIST];
         xor rsi, rsi;                           // op_args = 0 (no positional)
-        call AuditWire::audit_begin_op;
+        call audit_begin_op;
         cmp rax, 0;
         je  pl_broker_fail;
         mov r12, rax;                           // r12 = audit_id
@@ -177,12 +177,12 @@ module PkgList = structure {
         // Reset enumeration state up-front so a caller that runs
         // pkg_list_body twice in one process (shell subshell case)
         // sees a fresh count each time. Free-standing call, no args.
-        call PkgList::list_reset;
+        call list_reset;
 
         // Print the header. rdi = &LIST_HEADER, rsi = LIST_HEADER_LEN.
         lea rdi, [rip + LIST_HEADER];
         mov rsi, 20;                           // LIST_HEADER_LEN
-        call Print::print_str;
+        call print_str;
 
         // ---- M3-001: schema bind + PackageManifest[] emit -------------
         // Bind stdout to PackageManifest schema first; a caller
@@ -190,7 +190,7 @@ module PkgList = structure {
         // established binding before the first record lands. On bind
         // failure emit a stderr diagnostic + skip the emit; the text
         // side of the output still renders correctly.
-        call PipeSchemas::ps_bind_pkg_manifest;
+        call ps_bind_pkg_manifest;
         cmp rax, 0;                            // PS_OK
         jne pl_bind_fail;
 
@@ -202,7 +202,7 @@ module PkgList = structure {
         // in place while the enumerator's cap plumbing lands at M4.
         lea rdi, [rip + LIST_DEMO_PKG_NAME];
         mov rsi, 3;                            // LIST_DEMO_PKG_NAME_LEN
-        call PipeSchemas::ps_emit_pkg_manifest;
+        call ps_emit_pkg_manifest;
         // Emit rc ignored -- a downstream schema consumer sees the
         // record or it does not; the text side (header + placeholder)
         // continues either way.
@@ -212,13 +212,13 @@ module PkgList = structure {
       pl_bind_fail:
         lea rdi, [rip + LIST_SCHEMA_BIND_FAIL];
         mov rsi, 64;                           // LIST_SCHEMA_BIND_FAIL_LEN
-        call Print::print_err;
+        call print_err;
 
       pl_bind_ok:
 
         // Enumerate installed packages. Returns count in rax and also
         // populates enumerated_count. M1: stub always returns 0.
-        call PkgList::pkg_list_enumerate;
+        call pkg_list_enumerate;
 
         // Branch on count. cmp rax, 0 -> jne to the M2 print-loop
         // entry (dead code at M1). Fall-through prints the placeholder.
@@ -228,7 +228,7 @@ module PkgList = structure {
         // Zero-installed placeholder.
         lea rdi, [rip + LIST_PLACEHOLDER];
         mov rsi, 62;                           // LIST_PLACEHOLDER_LEN
-        call Print::print_str;
+        call print_str;
 
         jmp pkg_list_body_done_ok;
 
@@ -244,7 +244,7 @@ module PkgList = structure {
         // ---- Audit commit + exit-code 0 --------------------------------
         mov rdi, r12;                           // audit_id
         xor rsi, rsi;                           // exit_code = 0
-        call AuditWire::audit_commit_op;
+        call audit_commit_op;
         xor rax, rax;                           // EXIT_OK
         pop r12;
         pop rbx;

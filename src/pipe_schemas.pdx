@@ -153,7 +153,7 @@ module PipeSchemas = structure {
         // Slow-path: bind fd=1 to PackageManifest schema hash.
         mov rdi, 1;                              // PS_FD_STDOUT
         lea rsi, [rip + PACKAGE_MANIFEST_HASH];
-        call Binding::libpdx_semantic_pipe_bind;
+        call libpdx_semantic_pipe_bind;
         cmp rax, 0;                              // SP_OK
         jne ps_bpm_fail;
 
@@ -197,7 +197,7 @@ module PipeSchemas = structure {
 
         mov rdi, 1;
         lea rsi, [rip + INSTALL_PROGRESS_HASH];
-        call Binding::libpdx_semantic_pipe_bind;
+        call libpdx_semantic_pipe_bind;
         cmp rax, 0;
         jne ps_bip_fail;
 
@@ -295,7 +295,7 @@ module PipeSchemas = structure {
         mov rsi, r13;                            // &_pmf_scratch
         mov rdx, r12;
         add rdx, 8;                              // rec_len = 8 + name_len
-        call Send::send_record;
+        call send_record;
         cmp rax, 0;                              // SP_SEND_OK
         jne ps_ep_send_fail;
 
@@ -360,7 +360,7 @@ module PipeSchemas = structure {
         mov rdi, 1;                              // PS_FD_STDOUT
         lea rsi, [rip + _ipr_scratch];
         mov rdx, 16;                             // PS_IPR_BODY_LEN
-        call Send::send_record;
+        call send_record;
         cmp rax, 0;
         jne ps_ei_send_fail;
 

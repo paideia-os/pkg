@@ -97,7 +97,7 @@ module AuditWire = structure {
         // Delegate.
         mov rdi, rbx;
         mov rsi, r12;
-        call AuditClient::audit_begin;
+        call audit_begin;
         cmp rax, 0;
         je  aw_be_broker_fail;
 
@@ -109,7 +109,7 @@ module AuditWire = structure {
         // Diagnostic + return 0. rax is caller's exit signal.
         lea rdi, [rip + AUDIT_BROKER_MSG];
         mov rsi, 66;                          // AUDIT_BROKER_MSG_LEN
-        call Print::print_err;
+        call print_err;
         xor rax, rax;
         pop r12;
         pop rbx;
@@ -143,7 +143,7 @@ module AuditWire = structure {
         mov rdx, [rsi];                       // schema_hash u64 from hash blob
         // rsi already carries schema_hash_ptr (caller passed it as arg2).
         // rdi already carries audit_id (caller passed it as arg1).
-        call AuditClient::audit_record_output;
+        call audit_record_output;
         ret
       }
     }
@@ -165,7 +165,7 @@ module AuditWire = structure {
       effects: {mem, sysreg}, capabilities: {cap, sched},
       justification: "pkg.M3-003 audit_commit_op: delegate to AuditClient::audit_commit. Args pass through unchanged (rdi=audit_id, rsi=exit_code). rc verbatim; caller ignores. Effects tail mirrors AuditClient::audit_commit. Leaf. Labels: none.",
       block: {
-        call AuditClient::audit_commit;
+        call audit_commit;
         ret
       }
     }

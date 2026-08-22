@@ -111,7 +111,7 @@ module Dispatch = structure {
         push rbx;
         lea rdi, [rip + USAGE_MSG];
         mov rsi, 51;                           // USAGE_MSG_LEN
-        call Print::print_err;
+        call print_err;
         pop rbx;
         mov rax, 2;                            // EXIT_USAGE
         ret
@@ -194,7 +194,7 @@ module Dispatch = structure {
         lea r11, [rip + chosen_subcommand];
         mov [r11], rax;
 
-        call PkgInstall::pkg_install_body;
+        call pkg_install_body;
         pop rbx;
         ret
 
@@ -211,7 +211,7 @@ module Dispatch = structure {
         lea r11, [rip + chosen_subcommand];
         mov [r11], rax;
 
-        call PkgRemove::pkg_remove_body;
+        call pkg_remove_body;
         pop rbx;
         ret
 
@@ -226,7 +226,7 @@ module Dispatch = structure {
         lea r11, [rip + chosen_subcommand];
         mov [r11], rax;
 
-        call PkgList::pkg_list_body;
+        call pkg_list_body;
         pop rbx;
         ret
 
@@ -243,7 +243,7 @@ module Dispatch = structure {
         lea r11, [rip + chosen_subcommand];
         mov [r11], rax;
 
-        call PkgSubcommandsM1::pkg_verify_stub;
+        call pkg_verify_stub;
         pop rbx;
         ret
 
@@ -258,7 +258,7 @@ module Dispatch = structure {
         lea r11, [rip + chosen_subcommand];
         mov [r11], rax;
 
-        call PkgSubcommandsM1::pkg_keys_stub;
+        call pkg_keys_stub;
         pop rbx;
         ret
 
@@ -278,7 +278,7 @@ module Dispatch = structure {
         // Print prefix.
         lea rdi, [rip + UNK_PREFIX];
         mov rsi, 25;                            // UNK_PREFIX_LEN
-        call Print::print_err;
+        call print_err;
 
         // Compute name length by walking to NUL.
         // rdx = name walk cursor; length ends up in rdx (offset from rbx).
@@ -297,12 +297,12 @@ module Dispatch = structure {
         mov rdi, rbx;
         mov rsi, rdx;
         sub rsi, rbx;
-        call Print::print_err;
+        call print_err;
 
         // Print suffix.
         lea rdi, [rip + UNK_SUFFIX];
         mov rsi, 2;                             // UNK_SUFFIX_LEN
-        call Print::print_err;
+        call print_err;
 
         pop rbx;
         mov rax, 2;                             // EXIT_USAGE
