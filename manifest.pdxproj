@@ -15,7 +15,7 @@
 # build-out/pkg.caps for the InitCap sidecar packaging step at M5.
 
 name        = pkg
-version     = 0.1.0-m1
+version     = 0.2.0-m2
 kind        = tool
 entry       = PkgMain::pkg_main
 output      = build-out/pkg
@@ -25,6 +25,7 @@ caps_decl   = caps.decl
 # from `module <Basename> = structure { ... }` headers). -----------------
 sources:
   - src/print.pdx                 # sys_write(fd=1) helper
+  - src/kind_package_manifest.pdx # KIND_PACKAGE_MANIFEST = 0x193 (M2-001)
   - src/subcommands_m1_stubs.pdx  # install / remove / verify / keys stubs
   - src/list.pdx                  # `pkg list` body (M1: header + placeholder)
   - src/dispatch.pdx              # subcommand recognizer + routing

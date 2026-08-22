@@ -1,0 +1,530 @@
+// src/kind_package_manifest.pdx -- pkg.M2-001
+// KindPackageManifest module: userspace-defined derived-kind
+// KIND_PACKAGE_MANIFEST = 0x193, derived over KIND_PDXFS_FILE (0x195).
+//
+// Scope
+// -----
+// Per r49-r50-plan.md §5.1 the two derived kinds pkg introduces
+// (KIND_PACKAGE_MANIFEST 0x193, KIND_PACKAGE_REPO 0x192) are USERSPACE-
+// defined -- the plan doc §5.1 says:
+//
+//   "Both minted by `pkg` internally; downstream consumers hold
+//    sub-caps. Ordinal definitions land in
+//    paideia-os/pkg/src/kind_package_manifest.pdx and
+//    paideia-os/pkg/src/kind_package_repo.pdx and are cross-referenced
+//    from the kernel's kind registry via the R20b InitCap sidecar (no
+//    kernel-side .pdx files needed; the kinds are userspace-defined
+//    derived kinds)."
+//
+// This file lands the ordinal + the in-process bookkeeping table pkg
+// keeps for every manifest it has verified in this process (one row per
+// in-flight install / verify). Holding a live row is the userspace
+// equivalent of "the manifest's two ML-DSA-65 signatures verified and
+// its ROOT_FPR matched /system/keys/paideia_root_pk.fpr" -- so the
+// pkg_install body can extract the tar with confidence that the source
+// is already dual-signed.
+//
+// The row shape mirrors the kernel's kind_pdxfs_file.pdx row layout
+// (six u64 words per row, in_use[63:56] header discipline) so a future
+// migration -- if the plan later decides to promote KIND_PACKAGE_MANIFEST
+// to a kernel-side derived kind -- is a code move, not a data-shape
+// redesign.
+//
+// Row layout (48 bytes, six u64 words):
+//
+//   [+0]   header: in_use[63:56] | state[15:8] | flags[7:0]
+//   [+8]   pdxfs_row_id  (u64)   -- KIND_PDXFS_FILE row this manifest
+//                                    was read from (verified provenance)
+//   [+16]  author_fpr_lo (u64)   -- first  8B of sha3-256(AUTHOR_PUBKEY)
+//   [+24]  author_fpr_hi (u64)   -- next   8B of sha3-256(AUTHOR_PUBKEY)
+//   [+32]  root_fpr_lo   (u64)   -- first  8B of sha3-256(ROOT_PUBKEY)
+//   [+40]  root_fpr_hi   (u64)   -- next   8B of sha3-256(ROOT_PUBKEY)
+//
+// Note: the two sha3-256 fingerprints are 32 bytes each. The low 16B
+// (author_fpr_lo + author_fpr_hi = 128 bits) is enough for a keyed-hash
+// lookup at manifest-cap-lifetime -- collision-resistant against a
+// classical adversary. The remaining 16B of each fingerprint are held
+// in the manifest.pdxsig body itself (AUTHOR_FPR / ROOT_FPR tags at
+// design/manifest-format.md §4.2); the row is the fast-path handle, the
+// on-disk manifest is the durable record.
+//
+// State byte:
+//   PMF_STATE_UNVERIFIED = 0   -- reserved; a row is never left in this
+//                                 state by the mint helper.
+//   PMF_STATE_VERIFIED   = 1   -- both ML-DSA-65 sigs OK + ROOT_FPR
+//                                 matched paideia_root_pk.fpr.
+//   PMF_STATE_REVOKED    = 2   -- explicitly invalidated (M3+ audit
+//                                 disposition; M2 never sets it).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module KindPackageManifest (PascalCase basename).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every cmp reg, imm <= 0x7FFFFFFF (largest raw is 0xFFFF for the
+//     header state mask; the failure-taxonomy constants sit in the
+//     0xFFFFEC30..0xFFFFEC3F band and are staged via r11).
+//   - r11 is scratch (paideia-as-reserved); every large immediate is
+//     staged through it.
+//   - Six-push prologue + `sub rsp, 8` reserved pad on the mint walker
+//     keeps rsp%16 == 0 at every nested call, mirroring
+//     kind_pdxfs_file.pdx pdxfs_file_cap_mint_inner.
+
+module KindPackageManifest = structure {
+
+  // ---- Ordinal ---------------------------------------------------------
+  // 0x193 per r49-r50-plan.md §5 KIND ordinal reservations block.
+  // Derived over KIND_PDXFS_FILE (0x195) -- holding a valid manifest
+  // row proves the file the manifest was read from was itself PdxFS-
+  // authoritative (a file whose bytes were not tampered on the wire).
+  pub let KIND_PACKAGE_MANIFEST      : u64 = 0x193
+  pub let KIND_PACKAGE_MANIFEST_BASE : u64 = 0x195   // = KIND_PDXFS_FILE
+
+  // ---- States ----------------------------------------------------------
+  pub let PMF_STATE_UNVERIFIED : u64 = 0
+  pub let PMF_STATE_VERIFIED   : u64 = 1
+  pub let PMF_STATE_REVOKED    : u64 = 2
+  pub let PMF_STATE_MAX        : u64 = 2
+
+  // ---- Rights (userspace-narrowed) -------------------------------------
+  // Nominal rights the mint may hand a consumer. M2 does not enforce
+  // these at consumption sites (pkg is the only consumer at M2); the
+  // vocabulary is fixed here so a future consumer's caps.decl can name
+  // exactly what it needs.
+  pub let R_PACKAGE_MANIFEST_READ    : u64 = 0x001   // read the manifest fields
+  pub let R_PACKAGE_MANIFEST_INSTALL : u64 = 0x002   // consume as install-authority
+  pub let R_PACKAGE_MANIFEST_REVOKE  : u64 = 0x010
+  pub let R_PACKAGE_MANIFEST_ALL     : u64 = 0x013
+
+  // ---- Failure taxonomy -- 0xFFFFEC30..0xFFFFEC3F ---------------------
+  // Adjacent to KIND_PDXFS_FILE's band (0xFFFFEC20..0xFFFFEC2F) and
+  // disjoint from KIND_PDXFS_TXN's (0xFFFFEC10..0xFFFFEC1F) so a caller
+  // can distinguish the three by inspection of the return.
+  pub let PMF_OK              : u64 = 0
+  pub let PMF_TAIL_ENOSPC     : u64 = 0xFFFFEC3F
+  pub let PMF_TAIL_BAD_ARG    : u64 = 0xFFFFEC3E
+  pub let PMF_MINT_BAD_ROW    : u64 = 0xFFFFEC3D   // pdxfs_row_id out of range
+  pub let PMF_MINT_BAD_STATE  : u64 = 0xFFFFEC3C
+  pub let PMF_MINT_BAD_FPR    : u64 = 0xFFFFEC3B   // AUTHOR_FPR or ROOT_FPR zero
+  pub let PMF_BAD_SLOT        : u64 = 0xFFFFEC38
+  pub let PMF_REVOKE_ALREADY  : u64 = 0xFFFFEC36
+
+  pub let PMF_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let PMF_ROW_NONE   : u64 = 0xFF
+
+  // ---- Table ----------------------------------------------------------
+  // Eight rows -- deliberately narrower than kind_pdxfs_file's sixteen.
+  // One in-flight `pkg install` at a time is the M2 shape (single-package
+  // install path per r49-r50-plan.md §5.1 M2 line); the extra headroom
+  // covers a concurrent `pkg verify` sweep that walks every installed
+  // package's manifest inside one process. 8 * 48 = 384 bytes = 48 u64.
+  pub let PMF_MAX       : u64 = 8
+  pub let PMF_ROW_BYTES : u64 = 48
+  pub let mut _pmf_table : [u64; 48] = uninit @align(64)
+  pub let mut _pmf_stats : [u64; 8]  = uninit @align(64)
+
+  pub let PMF_ST_MINTS   : u64 = 0
+  pub let PMF_ST_REVOKES : u64 = 1
+  pub let PMF_ST_QUERIES : u64 = 2
+  pub let PMF_ST_REFUSED : u64 = 3
+
+  // ==========================================================================
+  // pmf_table_reset() -> ()
+  //
+  // Zero every row and every stat counter. Called by pkg_main once at
+  // program entry so a fresh process starts with an empty table; also
+  // called by the M4 test harness between test cases.
+  //
+  // Two separate store loops (rows / stats) rather than one over the
+  // sum, mirroring kind_pdxfs_file.pdx pdxfs_file_table_reset -- the
+  // two arrays have different lengths and one loop over their total
+  // would encode their .bss adjacency as a fact the code depends on.
+  //
+  // Leaf function; r10, rax, rcx scratch.
+  // ==========================================================================
+  pub let pmf_table_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-001 pmf_table_reset: clear every row (48 words) and every stat counter (8 words). Boot and test-harness only. Two separate loops mirroring kind_pdxfs_file.pdx's pdxfs_file_table_reset -- the two arrays have different lengths and one loop over their total would encode their .bss adjacency as a fact the code depends on. Labels prefixed kpm_rs_.",
+      block: {
+        lea r10, [rip + _pmf_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      kpm_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 48;
+        jb  kpm_rs_rows;
+
+        lea r10, [rip + _pmf_stats];
+        xor rcx, rcx;
+      kpm_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  kpm_rs_stats;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pmf_note(which) -> ()
+  //
+  // Bounded stat increment. Out-of-range `which` is a no-op so a caller
+  // that passes a bogus index does not fault -- same shape as
+  // kind_pdxfs_file.pdx pdxfs_file_note.
+  // ==========================================================================
+  pub let pmf_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-001 pmf_note: bounded stat increment. Out-of-range which no-ops. Labels prefixed kpm_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae kpm_nt_out;
+        lea r10, [rip + _pmf_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      kpm_nt_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pmf_stat(which) -> u64
+  //
+  // Bounded stat read. Out-of-range returns 0.
+  // ==========================================================================
+  pub let pmf_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-001 pmf_stat: bounded stat read. Out-of-range returns 0. Labels prefixed kpm_st_.",
+      block: {
+        cmp rdi, 8;
+        jae kpm_st_zero;
+        lea r10, [rip + _pmf_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      kpm_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pmf_tail_valid(row_id) -> 1 | 0
+  //
+  // 1 iff row_id < PMF_MAX AND the in_use byte at header[63:56] is set.
+  // Every accessor gates on this so a freed row answers PMF_DECODE_BAD.
+  // ==========================================================================
+  pub let pmf_tail_valid : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-001 pmf_tail_valid: row-liveness gate. Same shape as pdxfs_file_tail_valid. Row stride 48 = 32 + 16 (row*32 + row*16). Labels prefixed kpm_tv_.",
+      block: {
+        cmp rdi, 8;
+        jae kpm_tv_no;
+        lea r10, [rip + _pmf_table];
+        mov r11, rdi;
+        shl r11, 5;                      // row * 32
+        mov rax, rdi;
+        shl rax, 4;                      // row * 16
+        add r11, rax;                    // row * 48
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  kpm_tv_no;
+        mov rax, 1;
+        ret;
+      kpm_tv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pmf_tail_free(row_id) -> ()
+  //
+  // Scrub every one of the row's six words. Out-of-range no-op.
+  // ==========================================================================
+  pub let pmf_tail_free : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-001 pmf_tail_free: scrub every word so a stale reader cannot observe a live-looking row pointing at bytes no manifest names. Same shape as pdxfs_file_tail_free. Labels prefixed kpm_tf_.",
+      block: {
+        cmp rdi, 8;
+        jae kpm_tf_out;
+        lea r10, [rip + _pmf_table];
+        mov r11, rdi;
+        shl r11, 5;
+        mov rax, rdi;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+      kpm_tf_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pmf_cap_mint_inner(pdxfs_row_id, author_fpr_lo, author_fpr_hi,
+  //                    root_fpr_lo, root_fpr_hi) -> row_id | PMF_MINT_*
+  //
+  // Claim one row for a manifest whose two ML-DSA-65 signatures have
+  // already verified and whose ROOT_FPR matched paideia_root_pk.fpr.
+  // The caller (pkg_install body at M2-003) invokes this AFTER the
+  // manifest_codec's verification chain returns MANIFEST_VERIFY_OK.
+  //
+  // Gates in order:
+  //   (1) pdxfs_row_id < PMF_MAX-derived bound (< 16, kind_pdxfs_file
+  //       ceiling) -- refuses BAD_ROW.
+  //   (2) both author fingerprint halves nonzero -- refuses BAD_FPR
+  //       (an all-zero fingerprint is the free-slot sentinel and a
+  //       verified manifest never legitimately carries it).
+  //   (3) both root fingerprint halves nonzero -- same reasoning.
+  //   (4) low-first scan over the eight rows for an empty slot;
+  //       refuses ENOSPC if all are claimed.
+  //
+  // On success: writes the six-word row with header packed as
+  // in_use=1 << 56 | PMF_STATE_VERIFIED << 8, bumps PMF_ST_MINTS.
+  // On refusal: bumps PMF_ST_REFUSED and returns the specific error.
+  //
+  // Register plan (six callee-save pushes + one pad slot = 56 bytes):
+  //   rbx = pdxfs_row_id / scan cursor
+  //   r12 = author_fpr_lo
+  //   r13 = author_fpr_hi
+  //   r14 = root_fpr_lo
+  //   r15 = root_fpr_hi
+  //   rbp = row_id scratch during the free scan
+  //   Entry rsp%16 == 8; six pushes (-48B) -> rsp%16 == 8; sub rsp, 8
+  //   -> rsp%16 == 0 for every nested call site. Epilogue reverses.
+  // ==========================================================================
+  pub let pmf_cap_mint_inner : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pdxfs_row_id: u64) (author_fpr_lo: u64) (author_fpr_hi: u64) (root_fpr_lo: u64) (root_fpr_hi: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-001 pmf_cap_mint_inner: THE ONLY WRITER of _pmf_table. Gates: (1) pdxfs_row_id < 16 (kind_pdxfs_file PFF_MAX ceiling) or BAD_ROW; (2) author_fpr_lo|author_fpr_hi != 0 or BAD_FPR; (3) root_fpr_lo|root_fpr_hi != 0 or BAD_FPR; (4) low-first scan for empty row or ENOSPC. Six callee-save pushes + sub rsp, 8 = 56 bytes; entry rsp%16 == 8 -> post-prologue rsp%16 == 0 for the nested pmf_note call. Header packing writes in_use=1<<56 | PMF_STATE_VERIFIED (=1) << 8; the top bit lives at [63:56], the state occupies [15:8] per the row layout in the module preamble. Labels prefixed kpm_mi_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // pdxfs_row_id
+        mov r12, rsi;                    // author_fpr_lo
+        mov r13, rdx;                    // author_fpr_hi
+        mov r14, rcx;                    // root_fpr_lo
+        mov r15, r8;                     // root_fpr_hi
+
+        // (1) pdxfs_row_id < 16 (PFF_MAX ceiling from kind_pdxfs_file).
+        cmp rbx, 16;
+        jae kpm_mi_bad_row;
+
+        // (2) author_fpr both halves nonzero. OR them; zero if both zero.
+        mov rax, r12;
+        or  rax, r13;
+        cmp rax, 0;
+        je  kpm_mi_bad_fpr;
+
+        // (3) root_fpr both halves nonzero.
+        mov rax, r14;
+        or  rax, r15;
+        cmp rax, 0;
+        je  kpm_mi_bad_fpr;
+
+        // (4) low-first free scan.
+        xor rbp, rbp;                    // row_id cursor
+      kpm_mi_scan:
+        cmp rbp, 8;
+        jae kpm_mi_enospc;
+
+        lea r10, [rip + _pmf_table];
+        mov r11, rbp;
+        shl r11, 5;                      // row * 32
+        mov rax, rbp;
+        shl rax, 4;                      // row * 16
+        add r11, rax;                    // row * 48
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  kpm_mi_claim;
+
+        add rbp, 1;
+        jmp kpm_mi_scan;
+
+      kpm_mi_claim:
+        // Pack header: in_use=1<<56 | (PMF_STATE_VERIFIED=1 << 8).
+        // The in_use lane is bits [63:56]; the state lane is [15:8];
+        // the flags lane is [7:0] and stays zero at mint.
+        mov rax, 1;
+        shl rax, 56;                     // in_use bit
+        mov r11, 1;                      // PMF_STATE_VERIFIED
+        shl r11, 8;
+        or  rax, r11;
+        mov [r10 + 0],  rax;
+
+        mov [r10 + 8],  rbx;             // pdxfs_row_id
+        mov [r10 + 16], r12;             // author_fpr_lo
+        mov [r10 + 24], r13;             // author_fpr_hi
+        mov [r10 + 32], r14;             // root_fpr_lo
+        mov [r10 + 40], r15;             // root_fpr_hi
+
+        mov rax, rbp;                    // row_id return
+
+        // Bump MINTS; preserve rax across the call.
+        push rax;
+        mov rdi, 0;                      // PMF_ST_MINTS
+        call pmf_note;
+        pop rax;
+        jmp kpm_mi_out;
+
+      kpm_mi_enospc:
+        mov rax, 0xFFFFEC3F;
+        jmp kpm_mi_refused;
+      kpm_mi_bad_row:
+        mov rax, 0xFFFFEC3D;
+        jmp kpm_mi_refused;
+      kpm_mi_bad_fpr:
+        mov rax, 0xFFFFEC3B;
+
+      kpm_mi_refused:
+        push rax;
+        mov rdi, 3;                      // PMF_ST_REFUSED
+        call pmf_note;
+        pop rax;
+
+      kpm_mi_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pmf_cap_revoke(row_id) -> PMF_OK | PMF_BAD_SLOT | PMF_REVOKE_ALREADY
+  //
+  // Scrub the row and bump REVOKES. Distinguishes never-existed
+  // (BAD_SLOT) from already-gone (REVOKE_ALREADY) so the caller can
+  // tell whether it revoked something or was late.
+  // ==========================================================================
+  pub let pmf_cap_revoke : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-001 pmf_cap_revoke: scrub row + bump REVOKES; distinguishes out-of-range (BAD_SLOT) from already-dead (REVOKE_ALREADY). Two callee-save pushes leave rsp%16 == 0 at the two nested calls. Labels prefixed kpm_cr_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        cmp r12, 8;
+        jae kpm_cr_bad_slot;
+
+        mov rdi, r12;
+        call pmf_tail_valid;
+        cmp rax, 0;
+        je  kpm_cr_already;
+
+        mov rdi, r12;
+        call pmf_tail_free;
+        mov rdi, 1;                      // PMF_ST_REVOKES
+        call pmf_note;
+        xor rax, rax;                    // PMF_OK
+        jmp kpm_cr_out;
+
+      kpm_cr_bad_slot:
+        mov rax, 0xFFFFEC38;
+        jmp kpm_cr_out;
+      kpm_cr_already:
+        mov rax, 0xFFFFEC36;
+
+      kpm_cr_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pmf_row_pdxfs(row_id) -> pdxfs_row_id | PMF_DECODE_BAD
+  //
+  // Read accessor for the recorded KIND_PDXFS_FILE row that the
+  // manifest was verified from.
+  // ==========================================================================
+  pub let pmf_row_pdxfs : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-001 pmf_row_pdxfs: pdxfs_row_id at [+8], or PMF_DECODE_BAD. Labels prefixed kpm_rp_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call pmf_tail_valid;
+        cmp rax, 0;
+        je  kpm_rp_bad;
+        lea r10, [rip + _pmf_table];
+        mov r11, r12;
+        shl r11, 5;
+        mov rax, r12;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp kpm_rp_out;
+      kpm_rp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      kpm_rp_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pmf_row_state(row_id) -> state_byte | PMF_DECODE_BAD
+  //
+  // Read the state byte (PMF_STATE_UNVERIFIED / VERIFIED / REVOKED)
+  // from header[15:8].
+  // ==========================================================================
+  pub let pmf_row_state : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.M2-001 pmf_row_state: state byte at header[15:8]. Labels prefixed kpm_rst_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call pmf_tail_valid;
+        cmp rax, 0;
+        je  kpm_rst_bad;
+        lea r10, [rip + _pmf_table];
+        mov r11, r12;
+        shl r11, 5;
+        mov rax, r12;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp kpm_rst_out;
+      kpm_rst_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      kpm_rst_out:
+        pop r12;
+        ret
+      }
+    }
+}
