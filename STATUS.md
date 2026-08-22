@@ -1,9 +1,13 @@
 # pkg — status
 
 **Wave:** R49 (Wave 1)
-**Current milestone:** M4 (tests + smoke) — CLOSED. Ready for M5
-(dual-signed pkg v1.0 release + `pkgs.paideia-os` mirror push +
-`.pdxdoc` for `doc pkg`).
+**Current milestone:** M5 (1.0 signed release) — M5-001 LANDED.
+M5-002 pending (`pkgs.paideia-os` mirror-push protocol +
+`doc/pkg.pdxdoc`).
+
+**Release:** 1.0.0 (`manifest.pdxproj` version 1.0.0). Signing
+state STUB at M5-close (v0.33-crypto-kdf gate); diff-flip when the
+crypto substrate lands. See `release/1.0/README.md` §3.
 
 ## Milestone rollup
 
@@ -24,6 +28,8 @@
 | M4-001 | sig-mismatch matrix (author bad, root bad, both bad -- all refuse) | LANDED | #13   |
 | M4-002 | partial-install rollback via KIND_PDXFS_TXN abort              | LANDED | #14   |
 | M4-003 | QEMU smoke: install -> list -> verify -> remove -> verify absent | LANDED | #15   |
+| M5-001 | dual-signed manifest.pdxsig for pkg v1.0 + CHANGELOG entry     | LANDED | #16   |
+| M5-002 | pkgs.paideia-os mirror push + .pdxdoc for doc pkg              | OPEN   | #17   |
 
 See `design/tooling/r49-r50-plan.md` §5.1 in paideia-os for the full
 breakdown (M1-M5) and cross-repo dependencies.
@@ -159,10 +165,37 @@ diff-flips.
   maintains. Blocks M4-003 remove step exit 0 and `pkg list --
   available` full enumeration.
 
-## M5 (next milestone)
+## M5-001 close status
 
-Per `design/tooling/r49-r50-plan.md` §5.1 M5 line: dual-signed
-`manifest.pdxsig` for pkg v1.0, CHANGELOG-1.0 entry, `pkgs.paideia-
-os` mirror push, `pkg keys` documentation of the paideia_root_pk
-fingerprint, `.pdxdoc` file for `doc pkg`. Depends on paideia-as
-v0.33-crypto-kdf (author + root signing) + doc.M2 reachable.
+M5-001 lands the 1.0.0 release-artefact chain. Every artefact is
+byte-deterministic against the M4-close binary; the v0.33-crypto-kdf
+gate is the only diff-flip point.
+
+- `manifest.pdxproj` version bumped `0.4.0-m4` → `1.0.0`
+  (drops milestone suffix; marks the ship point).
+- `release/1.0/gen-manifest.sh` — POSIX-sh generator emits
+  `manifest.pdxsig` (64B header + 4477B body + 6594B sigblock STUB)
+  + `pkg.tar` (bin/pkg + caps.decl + deps.list + doc/pkg.pdxdoc +
+  manifest.pdxsig, lexicographic member order).
+- `release/1.0/manifest-layout.md` — byte-level per-field layout
+  documentation.
+- `release/1.0/manifest-preview.hex` — hex dump of the STUB envelope
+  for review at M5-close without running the generator.
+- `release/1.0/keys-fingerprints.md` — paideia_root_pk +
+  pkg-author fingerprint documentation (STUB values at M5-close).
+- `release/1.0/README.md` — release-directory index + diff-flip
+  pointers.
+- `CHANGELOG.md` — 1.0.0 entry rolling up M1-M5 (17 issues) with
+  per-milestone attribution + dependency snapshot + known
+  limitations.
+- `design/release-1.0.md` — 1.0 release design (§1-§8: scope,
+  directory tree, byte layout, STUB envelope, CHANGELOG discipline,
+  mirror-push protocol, `.pdxdoc` shape, substrate gates).
+
+## M5-002 (next)
+
+Per `design/tooling/r49-r50-plan.md` §5.1 M5 line and
+`design/release-1.0.md` §6-§7: `pkgs.paideia-os` mirror-push
+protocol (`release/mirror-push.md` + `release/mirror-push.sh`) and
+the `.pdxdoc` file for `doc pkg` (`doc/pkg.pdxdoc`). Landing
+M5-002 closes M5 and enables the `pkg-v1.0.0` git tag.

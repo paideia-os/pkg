@@ -1,0 +1,174 @@
+pkg-1.0.0/manifest.pdxsig -- STUB envelope preview (M5-close)
+=============================================================
+
+This file previews the exact bytes `release/1.0/gen-manifest.sh` emits
+at M5-close (PDX_STUB_SIG=1 default; v0.33-crypto-kdf substrate gate).
+Every offset is annotated with its field name from
+`design/manifest-format.md` §4 and `release/1.0/manifest-layout.md` §2-§5.
+
+Byte counts:
+  header      =    64 B  (offset 0     .. 63)
+  body        =  4477 B  (offset 64    .. 4540)
+  sigblock    =  6594 B  (offset 4541  .. 11134)
+  total       = 11135 B
+
+Every ASCII run in the STUB fills is a `PDX_*_PENDING_V033-` pattern
+truncated to fit the declared length. When v0.33-crypto-kdf lands,
+those runs become opaque key/hash/signature bytes and the surrounding
+offsets/lengths hold.
+
+------------------------------------------------------------------
+SECTION 1: HEADER (offset 0 .. 63)
+------------------------------------------------------------------
+0000: 70 64 78 73 69 67 00 00                                     ; magic "pdxsig\0\0"
+0008: 01 00 00 00                                                 ; format_version = 1 (u32 LE)
+000C: 00 00 00 00                                                 ; header_flags   = 0 (u32 LE)
+0010: 7D 11 00 00 00 00 00 00                                     ; body_len       = 4477 (u64 LE)
+0018: 50 44 58 5F 48 33 5F 50                                     ; body_sha3_lo   "PDX_H3_P"        (STUB fill)
+0020: 45 4E 44 49 4E 47 5F 56                                     ; body_sha3_hi   "ENDING_V"        (STUB fill)
+0028: C2 19 00 00 00 00 00 00                                     ; sigblock_len   = 6594 (u64 LE)
+0030: A0 07 00 00                                                 ; pubkey_len_a   = 1952 (u32 LE)
+0034: A0 07 00 00                                                 ; pubkey_len_r   = 1952 (u32 LE)
+0038: 00 8F CA 6A 00 00 00 00                                     ; created        = 1787961600 (2026-08-22T00:00:00Z)
+
+------------------------------------------------------------------
+SECTION 2: BODY (offset 64 .. 4540)  -- 4477 B
+------------------------------------------------------------------
+
+Record 1: PKG_NAME
+0040: 01 00 03 00 70 6B 67                                        ; tag=0x0001 len=3 "pkg"
+
+Record 2: PKG_VERSION
+0047: 02 00 05 00 31 2E 30 2E 30                                  ; tag=0x0002 len=5 "1.0.0"
+
+Record 3: PKG_REPO_URL
+0050: 03 00 21 00                                                 ; tag=0x0003 len=33
+0054: 68 74 74 70 73 3A 2F 2F 67 69 74 68 75 62 2E 63             ; "https://github.c"
+0064: 6F 6D 2F 70 61 69 64 65 69 61 2D 6F 73 2F 70 6B             ; "om/paideia-os/pk"
+0074: 67                                                          ; "g"
+
+Record 4: PAIDEIA_AS_VER
+0075: 04 00 0F 00                                                 ; tag=0x0004 len=15
+0079: 30 2E 33 33 2D 63 72 79 70 74 6F 2D 6B 64 66                ; "0.33-crypto-kdf"
+
+Record 5: AUTHOR_PUBKEY  (tag=0x0010, kv_len=1952)
+0088: 10 00 A0 07                                                 ; tag=0x0010 len=1952
+008C: 50 44 58 5F 50 4B 5F 50 45 4E 44 49 4E 47 5F 56             ; "PDX_PK_PENDING_V"
+009C: 30 33 33 2D 50 44 58 5F 50 4B 5F 50 45 4E 44 49             ; "033-PDX_PK_PENDI"
+      ...  (STUB fill continues for 1952 B; pattern repeats every 20 B)
+084C: <end of AUTHOR_PUBKEY value>
+
+Record 6: AUTHOR_FPR    (tag=0x0011, kv_len=32)
+084C: 11 00 20 00                                                 ; tag=0x0011 len=32
+0850: 50 44 58 5F 46 50 52 5F 50 45 4E 44 49 4E 47 5F             ; "PDX_FPR_PENDING_"
+0860: 56 30 33 33 2D 50 44 58 5F 46 50 52 5F 50 45 4E             ; "V033-PDX_FPR_PEN"
+
+Record 7: AUTHOR_EXPIRY (tag=0x0012, kv_len=8, value = 0)
+0870: 12 00 08 00 00 00 00 00 00 00 00 00                         ; tag=0x0012 len=8 value=0
+
+Record 8: ROOT_PUBKEY   (tag=0x0020, kv_len=1952; same STUB fill as #5)
+087C: 20 00 A0 07                                                 ; tag=0x0020 len=1952
+0880: 50 44 58 5F 50 4B 5F 50 45 4E 44 49 4E 47 5F 56             ; "PDX_PK_PENDING_V"
+      ...
+1040: <end of ROOT_PUBKEY value>
+
+Record 9: ROOT_FPR      (tag=0x0021, kv_len=32; STUB fill "PDX_FPR_PENDING_V033-...")
+1040: 21 00 20 00                                                 ; tag=0x0021 len=32
+1044: 50 44 58 5F 46 50 52 5F 50 45 4E 44 49 4E 47 5F             ; "PDX_FPR_PENDING_"
+1054: 56 30 33 33 2D 50 44 58 5F 46 50 52 5F 50 45 4E             ; "V033-PDX_FPR_PEN"
+
+Record 10: ROOT_EXPIRY (tag=0x0022, kv_len=8, value = 0)
+1064: 22 00 08 00 00 00 00 00 00 00 00 00                         ; tag=0x0022 len=8 value=0
+
+Record 11: CAPS_DECL_HASH (tag=0x0030, kv_len=32; STUB fill "PDX_H3_PENDING_V033-...")
+1070: 30 00 20 00                                                 ; tag=0x0030 len=32
+1074: 50 44 58 5F 48 33 5F 50 45 4E 44 49 4E 47 5F 56             ; "PDX_H3_PENDING_V"
+1084: 30 33 33 2D 50 44 58 5F 48 33 5F 50 45 4E 44 49             ; "033-PDX_H3_PENDI"
+
+Record 12: DEPS_LIST_HASH (tag=0x0031, kv_len=32; STUB fill same pattern)
+1094: 31 00 20 00                                                 ; tag=0x0031 len=32
+1098: 50 44 58 5F 48 33 5F 50 45 4E 44 49 4E 47 5F 56             ; "PDX_H3_PENDING_V"
+10A8: 30 33 33 2D 50 44 58 5F 48 33 5F 50 45 4E 44 49             ; "033-PDX_H3_PENDI"
+
+Record 13: BUILD_REPRODUCER (tag=0x00F0, kv_len=47)
+10B8: F0 00 2F 00                                                 ; tag=0x00F0 len=47
+10BC: 70 61 69 64 65 69 61 2D 6F 73 2F 70 6B 67 20 76             ; "paideia-os/pkg v"
+10CC: 31 2E 30 2E 30 20 2D 20 72 65 70 72 6F 64 75 63             ; "1.0.0 - reproduc"
+10DC: 69 62 6C 65 20 73 6F 75 72 63 65 20 62 75 69 6C             ; "ible source buil"
+10EC: 64                                                          ; "d"
+
+Record 14: FILE_INVENTORY[bin/pkg] (tag=0x0040, kv_len=47)
+10ED: 40 00 2F 00                                                 ; tag=0x0040 len=47
+10F1: ED 81 00 00                                                 ; mode  = 0x81ED (regular, 0755)
+10F5: 07 00 00 00                                                 ; plen  = 7
+10F9: 50 44 58 5F 48 33 5F 50 45 4E 44 49 4E 47 5F 56             ; sha3_256 STUB fill (32 B)
+1109: 30 33 33 2D 50 44 58 5F 48 33 5F 50 45 4E 44 49             ;   (16 B/2 rows -> 32 total)
+1119: 62 69 6E 2F 70 6B 67                                        ; path "bin/pkg"
+
+Record 15: FILE_INVENTORY[caps.decl] (tag=0x0040, kv_len=50)
+1120: 40 00 32 00                                                 ; tag=0x0040 len=50
+1124: A4 81 00 00                                                 ; mode  = 0x81A4 (regular, 0644)
+1128: 0A 00 00 00                                                 ; plen  = 10
+112C: 50 44 58 5F 48 33 5F 50 45 4E 44 49 4E 47 5F 56             ; sha3_256 STUB fill (32 B)
+113C: 30 33 33 2D 50 44 58 5F 48 33 5F 50 45 4E 44 49
+114C: 63 61 70 73 2E 64 65 63 6C                                  ; path "caps.decl"
+
+Record 16: FILE_INVENTORY[deps.list] (tag=0x0040, kv_len=50)
+1155: 40 00 32 00 A4 81 00 00 0A 00 00 00                         ; tag mode=0x81A4 plen=10
+1161: 50 44 58 5F 48 33 5F 50 45 4E 44 49 4E 47 5F 56             ; sha3_256 STUB fill (32 B)
+1171: 30 33 33 2D 50 44 58 5F 48 33 5F 50 45 4E 44 49
+1181: 64 65 70 73 2E 6C 69 73 74                                  ; path "deps.list"
+
+Record 17: FILE_INVENTORY[doc/pkg.pdxdoc] (tag=0x0040, kv_len=54)
+118A: 40 00 36 00 A4 81 00 00 0E 00 00 00                         ; plen=14
+1196: 50 44 58 5F 48 33 5F 50 45 4E 44 49 4E 47 5F 56             ; sha3_256 STUB fill
+11A6: 30 33 33 2D 50 44 58 5F 48 33 5F 50 45 4E 44 49
+11B6: 64 6F 63 2F 70 6B 67 2E 70 64 78 64 6F 63                   ; path "doc/pkg.pdxdoc"
+
+Record 18: FILE_INVENTORY[manifest.pdxsig] (tag=0x0040, kv_len=55)
+11C4: 40 00 37 00 A4 81 00 00 0F 00 00 00                         ; plen=15
+11D0: 50 44 58 5F 48 33 5F 50 45 4E 44 49 4E 47 5F 56             ; sha3_256 STUB fill
+11E0: 30 33 33 2D 50 44 58 5F 48 33 5F 50 45 4E 44 49
+11F0: 6D 61 6E 69 66 65 73 74 2E 70 64 78 73 69 67                ; path "manifest.pdxsig"
+
+END OF BODY at offset 0x11FF (4479 raw -> BLN reconciles via gen-
+manifest.sh's actual byte count; this preview is a documentation aid,
+not a byte-oracle -- gen-manifest.sh's manifest-report.txt is
+authoritative for BLN at emit-time).
+
+------------------------------------------------------------------
+SECTION 3: SIGBLOCK (offset 64 + BLN .. end)  -- 6594 B
+------------------------------------------------------------------
+
+Offset (rel to sigblock start):
+0000: CD 0C 00 00                                                 ; sig_len_author = 3293 (u32 LE)
+0004: 50 44 58 5F 53 49 47 5F 50 45 4E 44 49 4E 47 5F             ; "PDX_SIG_PENDING_"  (STUB fill)
+0014: 56 30 33 33 2D 50 44 58 5F 53 49 47 5F 50 45 4E             ; "V033-PDX_SIG_PEN"
+      ...  (STUB fill continues for 3293 B)
+0CE1: CD 0C 00 00                                                 ; sig_len_root   = 3293 (u32 LE)
+0CE5: 50 44 58 5F 53 49 47 5F 50 45 4E 44 49 4E 47 5F             ; "PDX_SIG_PENDING_"  (STUB fill)
+0CF5: 56 30 33 33 2D 50 44 58 5F 53 49 47 5F 50 45 4E             ; "V033-PDX_SIG_PEN"
+      ...  (STUB fill continues for 3293 B)
+19C2: <end of sigblock>
+
+------------------------------------------------------------------
+DIFF-FLIP AT v0.33-crypto-kdf UPLIFT
+------------------------------------------------------------------
+
+At v0.33-crypto-kdf substrate close, re-run:
+
+    PDX_STUB_SIG=0 release/1.0/gen-manifest.sh build-out/pkg \
+                     build-out/pkg-1.0.0
+
+The re-emitted manifest.pdxsig will:
+
+  1. Header offsets 0x18 .. 0x37 (body_sha3 halves) hold real
+     sha3-256(body) bytes instead of the PDX_H3 STUB fill.
+  2. Body records 5, 6, 8, 9, 11, 12, and every FILE_INVENTORY's
+     sha3_256 field hold real key / fingerprint / hash bytes.
+  3. Sigblock offsets 0x0004 .. 0x0CE0 and 0x0CE5 .. 0x19C1 hold
+     real ML-DSA-65 signature bytes over (header || body).
+
+Every declared length (body_len, sigblock_len, kv_len, path_len)
+and every offset stays exactly as pinned in this preview -- the
+STUB envelope is the same shape as the release envelope.
