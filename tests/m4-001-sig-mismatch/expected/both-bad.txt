@@ -1,0 +1,10 @@
+# M4-001 both-bad expected outcome (M3-close substrate)
+#
+# Same reasoning as author-bad.txt -- all three cells hit pi_err_
+# header until the fixture wire-in lands, then the M5 discrimination
+# distinguishes them (both-bad first-fails at author sig, so it
+# tracks author-bad's diagnostic post-uplift). See design/test-
+# matrix.md §2.3.
+
+exit=1
+stderr[0]=pkg install: header parse failed (see errno)

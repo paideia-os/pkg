@@ -1,0 +1,27 @@
+# M4-001 author-bad expected outcome (M3-close substrate)
+#
+# At M4-close pkg's install path halts at pi_err_header because
+# _install_staging is not yet wire-populated from a file (that read
+# is a M5-prep substrate uplift -- design/install-flow.md §5). The
+# zero-init .bss buffer fails the magic check in mc_read_header and
+# every fixture produces the same header-refuse diagnostic. This
+# proves the "refuse" property (D4) but not the discrimination
+# property (the three cells are indistinguishable at the observable
+# surface today).
+#
+# Uplift path -- expected file diff-flips at each substrate step:
+#   step 1: fixture wire-in lands (KIND_PDXFS_FILE read into _install_
+#           staging) -> stderr[0] flips to INSTALL_ERR_VERIFY / MC_
+#           VERIFY_STUB (all three cells still identical).
+#   step 2: paideia-as v0.33-crypto-kdf lands (ml_dsa_65_verify) ->
+#           stderr[0] flips to the specific author-refused
+#           diagnostic (M5 semantics).
+#
+# Format:
+#   exit=<int>
+#   stderr[0]=<pinned first line of stderr>
+#
+# See design/test-matrix.md §2.3 for the assertion protocol.
+
+exit=1
+stderr[0]=pkg install: header parse failed (see errno)
