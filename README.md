@@ -289,9 +289,18 @@ Every subcommand journals to `/system/audit/user-events/` through
 audit_id = audit_begin_op(OP_NAME_PTR, OP_ARGS_PTR)
 if audit_id == 0: exit 4   # AUDIT_EXIT_BROKER_FAIL (ENH-003 #28)
 ... subcommand output ...
-audit_record_op_output(audit_id, SCHEMA_HASH_PTR)   # optional
+audit_record_op_output(audit_id, SCHEMA_HASH_PTR)   # skipped by text-only bodies
 audit_commit_op(audit_id, exit_code)
 ```
+
+`audit_record_op_output` is called once by every subcommand that emits
+a schema-typed record (ENH-012 #37): `list` records
+`pdxsig.pkg.pmf.v1` after a successful `PackageManifest` emit;
+`install` records `pdxsig.pkg.ipr.v1` right after the
+`InstallProgressRecord` schema bind. `remove`, `verify` and `keys`
+emit no schema records at 1.0.0 and skip the call, so their audit
+entries carry an empty `output_schema` / `output_hash` column rather
+than an absent one.
 
 `OP_NAME_*` are NUL-terminated `.rodata` strings and form the `op_name`
 column a supervisor filters on — they are a public interface and stay

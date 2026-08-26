@@ -157,7 +157,7 @@ module List = structure {
   pub let pkg_list_body : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "pkg.M3-003 pkg_list_body, exit code widened at ENH-003 (#28): (1) audit_begin_op BEFORE any stdout emission (I5 upgrade -- every operation is discoverable). (2) On broker unavailable (rax == 0), print refusal diagnostic + return AUDIT_EXIT_BROKER_FAIL (4) WITHOUT touching stdout; the diagnostic goes to stderr per D3. (3) Body proceeds as before; audit_commit_op at exit. Prologue widens to 2 pushes (rbx=exit code / rbx unused, r12=audit_id) leaving rsp%16 == 0 for every nested call. sysreg effect + cap+sched from AuditClient's tail. All immediates within cmp reg,imm <= 0x7FFFFFFF. Labels prefixed pl_.",
+      justification: "pkg.M3-003 pkg_list_body, exit code widened at ENH-003 (#28): (1) audit_begin_op BEFORE any stdout emission (I5 upgrade -- every operation is discoverable). (2) On broker unavailable (rax == 0), print refusal diagnostic + return AUDIT_EXIT_BROKER_FAIL (4) WITHOUT touching stdout; the diagnostic goes to stderr per D3. (3) Body proceeds as before; AuditWire::audit_record_op_output (ENH-012 #37) fires once after a successful PackageManifest emit, recording output_schema = pdxsig.pkg.pmf.v1 on the audit entry; audit_commit_op at exit. Prologue widens to 2 pushes (rbx=exit code / rbx unused, r12=audit_id) leaving rsp%16 == 0 for every nested call. sysreg effect + cap+sched from AuditClient's tail. All immediates within cmp reg,imm <= 0x7FFFFFFF. Labels prefixed pl_.",
       block: {
         // Prologue: preserve rbx (M2 loop counter / unused at M3) +
         // r12 (audit_id across the body). rsp%16: 8 -> 0.
@@ -206,6 +206,15 @@ module List = structure {
         // Emit rc ignored -- a downstream schema consumer sees the
         // record or it does not; the text side (header + placeholder)
         // continues either way.
+
+        // ENH-012 (#37): record the schema this run actually emitted
+        // on the typed side of stdout, so a supervisor correlating
+        // /system/audit/user-events/ against the record stream sees
+        // output_schema = pdxsig.pkg.pmf.v1 rather than an empty
+        // column. r12 (audit_id) is callee-save and survives.
+        mov rdi, r12;                           // audit_id
+        lea rsi, [rip + PACKAGE_MANIFEST_HASH];
+        call audit_record_op_output;
 
         jmp pl_bind_ok;
 

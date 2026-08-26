@@ -175,11 +175,17 @@ audit record shape (libpdx-audit v0.2):
   subcommand    : "install" | "remove" | "list" | "verify" | "keys"
   argv          : bytes          -- full argv for reconstruction
   user          : Cap<KIND_USER> -- invoker identity
-  output_schema : "pdxsig.pkg.pmf.v1" | "pdxsig.pkg.ipr.v1" | ...
-  output_hash   : [u8;32]        -- sha3-256 of the emitted bytes
+  output_schema : "pdxsig.pkg.pmf.v1" (list) | "pdxsig.pkg.ipr.v1" (install) | empty
+  output_hash   : u64             -- low qword of the schema-hash constant
+                                     (synthetic at 1.0.0 -- a real BLAKE3/
+                                     sha3-256 of the emitted bytes lands
+                                     once a consumer needs it; see ENH-012 #37)
   exit_code     : i32
   wall_time_ns  : u64
 
+`list` and `install` populate output_schema/output_hash once per run
+(ENH-012 #37); `remove`, `verify` and `keys` emit no schema record at
+1.0.0 so the column is empty for those subcommands' audit entries.
 `pkg install` additionally journals one InstallProgressRecord per
 stage to the semantic pipe (not the audit journal); the audit
 journal records the final exit only.
