@@ -2,8 +2,8 @@
 .pdxdoc-tool pkg
 .pdxdoc-tool-version 1.0.0
 .pdxdoc-tool-repo https://github.com/paideia-os/pkg
-.pdxdoc-tool-wave R49
-.pdxdoc-tool-milestone M5
+.pdxdoc-tool-wave R49 (shipped); Enhancement v1.x (milestone 7, in progress)
+.pdxdoc-tool-milestone M5 (closed, 1.0.0); ENH-002 (#27) pinned this file to source
 .pdxdoc-format-notes This file is consumed by the `doc` tool
   (github.com/paideia-os/doc). Sections are blank-line-separated.
   Section headers are ALL-CAPS on a line by themselves. Bullets are
@@ -13,21 +13,22 @@
 
 NAME
 
-pkg -- paideia-os package manager. Installs, upgrades, removes,
-lists, and audits signed tool packages from pkgs.paideia-os and
-mirrors; the tool that bootstraps every other tool in the R49/R50
-waves.
+pkg -- paideia-os package manager. Installs, removes, lists, and
+audits signed tool packages; the tool that bootstraps every other
+tool in the R49/R50 waves. (There is no `upgrade` subcommand at
+1.0.0 -- tracked as open issue #23, not yet landed.)
 
 SYNOPSIS
 
-pkg <subcommand> [<flags>] [<arguments>]
+pkg <subcommand> [<arguments>]
 
-Subcommands (M5 vocabulary):
+Subcommands recognised by `Dispatch::dispatch_subcommand` (exact
+byte-compare on five names with distinct first bytes):
 - install <name>                 -- install a signed package
 - remove  <name>                 -- remove an installed package (undo-journalled)
-- list    [--available]          -- list installed (or available) packages
-- verify  <name>                 -- re-verify an installed package's signatures
-- keys    list                   -- list the signing keys pkg trusts
+- list                           -- list installed packages
+- verify  <name>                 -- re-verify an installed package's signatures (stub at 1.0.0)
+- keys                           -- show the trusted signing keys (stub at 1.0.0)
 
 pkg --help                       -- print usage + one line per subcommand
 pkg --version                    -- print "pkg 1.0.0"
@@ -35,69 +36,95 @@ pkg --version                    -- print "pkg 1.0.0"
 --help and --version are wired at the top level (ENH-006 #31): they
 short-circuit before subcommand dispatch and work with or without a
 subcommand or positional argument present. No other flag has a body
-wired at 1.0.0 (see README.md's capabilities section and ENH-002 for
-the reserved-but-unwired I3 vocabulary).
+wired at 1.0.0.
+
+--dry-run, --json and --schema are recognised by libpdx-argv's parser
+(they parse cleanly) but have no body -- passing them today has no
+observable effect. --dry-run is tracked as ENH-007 (#32); --json /
+--schema stay reserved-and-unwired until `list` / `install` emit live
+records rather than one demo record per run. No other flag exists in
+this tool's vocabulary: `--verbose`, `--quiet`, `--color=`, and
+`--no-cap:<name>` were never real (see design/argv-surface.md §4).
 
 DESCRIPTION
 
-pkg is the R49 wave package manager. Every tool in the paideia-os
-tooling ecosystem ships as a dual-signed package; pkg is the tool
-that fetches, verifies, and installs them, and the first tool that
-bootstraps itself by running `pkg install pkg` against a from-source
-build.
+pkg is the R49-wave package manager: the tool that installs every
+other tool in the paideia-os tooling ecosystem, and the one that
+bootstraps itself (`pkg install pkg` against a from-source build).
 
-The install pipeline is 4 stages, sequenced in
-src/install.pdx per design/install-flow.md §3:
+**Dual-signed manifests.** Every package ships a `manifest.pdxsig`
+whose 64-byte header reserves two separate public-key lengths (author
++ paideia-root) and whose signature block is exactly
+2 x (4B length + signature), both ML-DSA-65 over `header || body`.
+`mc_verify_signatures` verifies author then root, then cross-checks
+the manifest's `ROOT_FPR` tag against the machine-local fingerprint at
+/system/keys/paideia_root_pk.fpr. A compromised author key does not
+compromise the mirror. Verification is all-or-nothing.
 
-- FETCH: acquire the package manifest + tar from the mirror.
-- VERIFY: dual ML-DSA-65 signature verify (author + paideia-root),
-  sha3-256 body-hash cross-check, per-file inventory hash check.
-- UNPACK: extract the tar into a KIND_PDXFS_TXN scope so a partial
-  install rolls back cleanly.
-- RENAME: atomically move the extracted tree into /pkgs/<name>-
-  <version>/ and update /system/packages/index.pdxlist.
-
-Verification is all-or-nothing: no output byte reaches the user
-until both signatures verify. This is the D4 audit-first discipline
-in the r49-r50-plan.md.
+At 1.0.0 this verification has never actually run: `mc_verify_body_hash`
+and `mc_verify_signatures` (`src/manifest_codec.pdx`) return unconditional
+STUB codes (`MC_HASH_STUB` / `MC_VERIFY_STUB`) pending the paideia-as
+ML-DSA-65 verify intrinsic (blocked on paideia-as v0.33-crypto-kdf; the
+sign half of that intrinsic landed at paideia-as v0.23.0, but pkg needs
+verify, not sign). No signature has ever been checked by this tool.
+`install` also has no network-fetch stage at 1.0.0: it reads a fixed
+staging path (`_install_staging`, currently zero-init `.bss`) rather
+than fetching from a mirror, so it refuses at the header-magic check
+before reaching either verify seam.
 
 SUBCOMMANDS
 
 install <name>
-  Fetch, verify, and install <name> from the currently-configured
-  mirror. Acquires KIND_PDXFS_FILE(write,/pkgs) for a 60s window
-  via libpdx-elevate (see src/pkg_elevate.pdx). Refuses if either
-  signature fails, if the body-hash mismatches the header, or if
-  the caps.decl hash in the manifest does not match the caps.decl
-  packaged in the tar. Emits an InstallProgressRecord per stage on
-  the semantic pipe (pdxsig.pkg.ipr.v1 schema).
+  Real pipeline (`src/install.pdx`); refuses at the header stage today
+  because `_install_staging` is zero-init and fails the "pdxsig\0\0"
+  magic check -- exit 1. Steps, in order: header parse -> body-hash
+  verify (STUB) -> signature verify (STUB) -> KindPackageManifest
+  mint -> elevate for KIND_PDXFS_FILE(write,/pkgs) (60s window, via
+  libpdx-elevate; ENH-008 #33) -> KIND_PDXFS_TXN open -> extract
+  (STUB) -> commit. Emits one InstallProgressRecord per stage on the
+  semantic pipe (pdxsig.pkg.ipr.v1 schema) and records that schema on
+  the audit entry (ENH-012 #37).
 
 remove <name>
-  Remove an installed package. Writes an undo record to /journal/
-  pkg/ so `undo pkg install <name>` reconstructs the install from
-  the trash-subtree entry. `--wipe` shreds the trash entry
-  immediately (audit-flagged as unrecoverable). Removes from
-  /system/packages/index.pdxlist.
+  Real pipeline (`src/remove.pdx`); refuses at the lookup stage today
+  (`/system/packages/` has no readdir op at this substrate) -- exit 1.
+  Since ENH-008 (#33), remove also requests the same bounded-lifetime
+  KIND_PDXFS_FILE(write,/pkgs) cap install does, ahead of the lookup
+  stage, so it never gains a live unelevated destructive path once the
+  readdir gate closes. Writes a `pdxundo` header (real byte layout;
+  body-loop lands with the per-file tar walk) so a future `undo pkg
+  remove <name>` can reconstruct the install from the trash subtree.
+  `--wipe` is not implemented -- stripped from this doc per ENH-002
+  (#27); shipping an irreversible trash-shred ahead of the recoverable
+  trash path itself inverts the I5 undo obligation.
 
-list [--available]
-  Without --available, walks /system/packages/ and prints one line
-  per installed package. With --available, queries the current
-  mirror for its full package index and prints one line per
-  available package. Emits PackageManifest records on the
-  semantic pipe (pdxsig.pkg.pmf.v1 schema).
+list
+  Real body (`src/list.pdx`); prints a header + a fixed placeholder
+  line, exit 0. `pkg_list_enumerate` is a STUB that always returns 0 --
+  no live walk of `/system/packages/` exists yet. Emits one demo
+  PackageManifest record (name "pkg") on the semantic pipe
+  (pdxsig.pkg.pmf.v1 schema) and records that schema on the audit
+  entry (ENH-012 #37). `--available` (query a mirror index) is not
+  implemented -- stripped from this doc per ENH-002; blocked on the
+  readdir gate and superseded by the index-format question open issue
+  #20 raises.
 
 verify <name>
-  Re-verify an already-installed package's signatures against the
-  packaged manifest.pdxsig. Does not touch the network; the
-  manifest travels with the install. Useful after a
-  paideia_root_pk rotation to confirm every installed package
-  still verifies under the new fingerprint.
+  Stub at 1.0.0 (`PkgSubcommandsM1::pkg_verify_stub`): prints
+  "pkg verify: body not implemented at M1 (lands at M2)" and exits 3.
+  Ignores any positional argument. A real body is the cheapest genuine
+  win in this backlog -- no network or elevate needed, the manifest
+  already travels with the install -- tracked as ENH-004 (#29).
 
-keys list
-  List the signing keys pkg trusts. Reads /system/keys/
-  paideia_root_pk.fpr and prints the sha3-256 fingerprint per key
-  in ml-dsa-65 format. See release/1.0/keys-fingerprints.md in
-  the pkg repo for the fingerprint discipline.
+keys
+  Stub at 1.0.0 (`PkgSubcommandsM1::pkg_keys_stub`): prints
+  "pkg keys: body not implemented at M1 (lands at M5)" and exits 3.
+  Dispatch matches `keys\0` only and ignores any further positional,
+  so `pkg keys list` and `pkg keys` are identical today. A real `keys
+  list` body needs a `/system/keys/` read authority this tool's
+  baseline `caps.decl` does not yet grant -- tracked as ENH-005 (#30).
+  `keys add` / `keys remove` are out of scope at any milestone
+  (trust-root mutation through the package manager).
 
 CAPS
 
@@ -105,55 +132,69 @@ Baseline (loader-seeded via InitCap sidecar):
 - KIND_USER (self)                            -- identity root
 - KIND_IPC_ENDPOINT (invoke)                  -- pipe substrate
 - KIND_PDXFS_FILE (read, /system/packages/)   -- package enumeration
-- KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)  -- per-install
+- KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)  -- install + remove
                                                         elevate flow
 
-Per-install (acquired via libpdx-elevate for a 60s window):
-- KIND_PDXFS_FILE (write, /pkgs)              -- install destination
-- KIND_NETWORK   (fetch, pkgs.paideia-os)     -- mirror fetch
-- KIND_SIGNATURE (verify, paideia_root_pk)    -- sig-verify
+Per-operation (acquired via libpdx-elevate for a 60s window, both
+`install` and `remove` since ENH-008 #33):
+- KIND_PDXFS_FILE (write, /pkgs)              -- install/remove destination
 
-pkg NEVER runs with ambient write authority on /pkgs/. Write caps
-are acquired per-install via the elevate broker per D4
-discipline. See caps.decl in the pkg repo for the full manifest.
+The elevate mask requests bit 0 only (`PE_CAP_MASK_PDXFS_WRITE_PKGS =
+0x01`). It does **not** also acquire KIND_NETWORK or KIND_SIGNATURE in
+the same window -- an earlier draft of this document claimed both;
+neither bit is wired (`src/pkg_elevate.pdx` notes bits 0x02/0x04 as
+originally planned for M4, which closed without them). `list`,
+`verify` and `keys` never elevate -- they never mutate `/pkgs`.
+
+pkg NEVER runs with ambient write authority on /pkgs/. Write caps are
+acquired per-operation via the elevate broker per D4 discipline. See
+caps.decl in the pkg repo for the full manifest.
 
 EXAMPLES
 
-Install ls (the coreutils listing tool):
-  pkg install ls
-  # -> InstallProgressRecord[RESOLVED, VERIFIED_AUTHOR,
-  #                          VERIFIED_ROOT, CAP_AUDIT, INSTALLED]
-  # -> exit 0
+The outputs below are the pinned 1.0.0 behaviour from
+tests/m4-003-qemu-smoke/expected/full-matrix.txt -- every mutating
+path halts at a substrate seam, so these are exactly what a real
+paideia-os user sees today, not an aspirational happy path.
+
+Install a package (refuses at the header stage; no network fetch
+exists at 1.0.0, and neither verify seam is reachable yet):
+  pkg install libpng
+  # -> pkg install: staging manifest for package 'libpng'
+  # -> pkg install: header parse failed (see errno)      [stderr]
+  # -> exit 1
 
 List installed packages:
   pkg list
-  # -> PackageManifest records: pkg, ls, cat, doc, ...
+  # -> installed packages:
+  # ->   (none -- pkg list wires to /system/packages/ readdir at M2)
   # -> exit 0
 
-Verify an installed package:
-  pkg verify pkg
-  # -> InstallProgressRecord[VERIFIED_AUTHOR, VERIFIED_ROOT]
+Remove a package (refuses at the lookup stage; elevate now requested
+first per ENH-008, but the broker is unregistered so the request never
+dispatches -- see paideia-os R48-PREP-005):
+  pkg remove libpng
+  # -> pkg remove: removing name 'libpng'
+  # -> pkg remove: /system/packages/ readdir unavailable at M2 (R42)  [stderr]
+  # -> exit 1
+
+Re-verify an installed package's signatures (stub):
+  pkg verify
+  # -> pkg verify: body not implemented at M1 (lands at M2)
+  # -> exit 3
+
+Unknown or missing subcommand:
+  pkg banana
+  # -> pkg: unknown subcommand 'banana'                  [stderr]
+  # -> exit 2
+  pkg
+  # -> usage: pkg <install|remove|list|verify|keys> [ARG]  [stderr]
+  # -> exit 2
+
+--help / --version (ENH-006 #31), with no subcommand present:
+  pkg --version
+  # -> pkg 1.0.0
   # -> exit 0
-
-Remove a package (undo-journalled):
-  pkg remove ls
-  # -> writes /journal/pkg/undo-<ts>.record
-  # -> `undo pkg install ls` reconstructs the install
-  # -> exit 0
-
-List signing keys:
-  pkg keys list
-  # -> paideia_root  ml-dsa-65  <fingerprint>  (rotated: never)
-  # -> pkg-author    ml-dsa-65  <fingerprint>  (rotated: never)
-  # -> exit 0
-
-Semantic-pipe filter (e.g. installed packages authored by <fpr>):
-  pkg list | query "PackageManifest.author_fpr == '<fpr>'"
-
-Cross-boundary install (elevate to /system/):
-  pkg install --dest /system/tools some-tool
-  # -> libpdx-elevate prompts the founder via svc.elevate-broker
-  # -> InstallProgressRecord[ELEVATE_PENDING, ELEVATE_APPROVED, ...]
 
 SEE ALSO
 
@@ -167,8 +208,11 @@ SEE ALSO
 AUDIT
 
 Every pkg subcommand journals to /system/audit/user-events/
-pkg-<ts>-<audit_id>.pdxevent before emitting any output. The
-audit record shape (libpdx-audit v0.2):
+pkg-<ts>-<audit_id>.pdxevent before emitting any output. If the audit
+broker is unavailable, the subcommand emits no output of its own and
+exits 4 (`AUDIT_EXIT_BROKER_FAIL`, split from `EXIT_NOT_YET_IMPLEMENTED`
+at ENH-003 #28 -- the two used to share exit code 3). The audit record
+shape (libpdx-audit v0.2):
 
   audit_id      : u64            -- monotonic per-tool counter
   tool          : "pkg"
@@ -187,10 +231,13 @@ audit record shape (libpdx-audit v0.2):
 (ENH-012 #37); `remove`, `verify` and `keys` emit no schema record at
 1.0.0 so the column is empty for those subcommands' audit entries.
 `pkg install` additionally journals one InstallProgressRecord per
-stage to the semantic pipe (not the audit journal); the audit
-journal records the final exit only.
+stage to the semantic pipe (not the audit journal); the audit journal
+records the final exit only.
 
 VERSION
 
-pkg 1.0.0 (2026-08-22). See CHANGELOG.md in the pkg repo for the
-per-milestone rollup and known limitations at 1.0-close.
+pkg 1.0.0 (2026-08-22). See CHANGELOG.md and design/enhancement-plan.md
+in the pkg repo for the post-1.0.0 enhancement wave and known
+limitations. This file was pinned to source at ENH-002 (#27); it had
+drifted to describe a substantially larger tool than the one that
+exists (`design/enhancement-plan.md` §2 has the full audit).

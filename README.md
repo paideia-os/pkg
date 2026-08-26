@@ -65,7 +65,7 @@ never mutate `/pkgs`.
 
 **Audit-first.** Every subcommand body calls `AuditWire::audit_begin_op`
 *before* any byte reaches stdout or stderr. If the audit broker is
-unavailable the subcommand emits no output of its own and exits 3 — pkg
+unavailable the subcommand emits no output of its own and exits 4 — pkg
 refuses to act un-journalled rather than acting silently.
 
 **Substrate state at 1.0.0.** Several verification and filesystem

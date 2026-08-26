@@ -68,19 +68,28 @@ documented as it happens; M1 has no such collision.
 For each subcommand the M1 recognizer accepts any number of
 additional positionals, and the M2 body enforces the real contract:
 
-- `install <name>[@version]` — name of a package to install, optionally
-  with `@version` (semver) selector. Default version resolves via the
-  index at the default repo. M2 body enforces exactly one name
-  positional; more than one is `EXIT_USAGE`.
-- `remove <name>` — name of an installed package to remove. M2 body
-  enforces exactly one name positional.
-- `list` — no additional positionals (M2 body will accept `--available`
-  to list-from-repo rather than list-installed; the flag is standard-
-  vocabulary style, `--pdx-schema` gates the schema variant).
-- `verify <name>` — name of an installed package to re-verify. Zero
-  positionals verifies every installed package.
-- `keys` (`list` | `add` | `remove` — nested subcommand). M5 lands the
-  key-management surface; M1 stub prints a diagnostic naming M5.
+- `install <name>` — name of a package to install. Body (`src/install.pdx`)
+  enforces exactly one name positional; more than one is `EXIT_USAGE`.
+  A `@version` selector is **not** part of the contract at 1.0.0 --
+  stripped per the ENH-002 (#27) audit until ENH-001 (#26) settles
+  which index format (and therefore which version-selection scheme)
+  wins between the shipped R49 design and the open R70 MVP plan.
+- `remove <name>` — name of an installed package to remove. Body
+  (`src/remove.pdx`) enforces exactly one name positional.
+- `list` — no additional positionals. `--available` (list-from-repo
+  rather than list-installed) is **not** implemented and is stripped
+  per ENH-002 -- blocked on the `/system/packages/` readdir gate and
+  superseded by the index redesign in open issue #20; restore once
+  ENH-001 settles the index format.
+- `verify <name>` — name of an installed package to re-verify. Still a
+  stub at 1.0.0 (`PkgSubcommandsM1::pkg_verify_stub`, exit 3); real
+  body tracked as ENH-004 (#29).
+- `keys` — stub at 1.0.0 (`PkgSubcommandsM1::pkg_keys_stub`, exit 3).
+  Dispatch matches `keys\0` only and ignores any further positional,
+  so `pkg keys list` and `pkg keys` are identical today. A `list`
+  nested subcommand is the intended real-body contract (ENH-005 #30).
+  `keys add` / `keys remove` (trust-root mutation through the package
+  manager) are out of scope at any milestone -- stripped per ENH-002.
 
 ## 4. Standard flag vocabulary (I3)
 
@@ -96,8 +105,20 @@ land in later milestones:
 | `--dry-run`    | recognised | reserved   | previews the effect on install/remove without writing (ENH-007 #32, blocked on ENH-001 #26) |
 | `--json`       | recognised | reserved   | emit `PackageManifest[]` etc. as JSON on stdout, suppressing text    |
 | `--schema`     | recognised | reserved   | print the subcommand's output schema definition and exit             |
-| `--verbose`    | recognised | reserved   | additional diagnostic output on stderr, including audit-record ids   |
 | `--pdx-schema` | recognised | M3-001     | libpdx-argv's well-known flag; sets `emit_schema=1` in ParsedArgs    |
+
+`--verbose` is deliberately **not** in this table (stripped, not
+reserved, per the ENH-002 #27 audit): it is cosmetic for a tool whose
+entire output surface is a handful of fixed lines, and its documented
+behaviour elsewhere ("audit-record ids on stderr") is better served by
+reading the audit journal directly. `--quiet`, `--color={always|auto|
+never}` and `--no-cap:<name>` are stripped for the same reason and are
+**not part of this repo's own reserved vocabulary at all** -- they
+should never have appeared in `doc/pkg.pdxdoc`'s flag line (fixed at
+ENH-002). `--color=` additionally contradicted this document's own §7
+("No colour output"). `--no-cap:<name>` would require pkg to drop its
+own capabilities per invocation -- a loader/`libpdx-cap` primitive pkg
+cannot implement unilaterally, and a footgun if it could.
 
 `--help` and `--version` are the only two flags with a real body at
 1.0.0 + ENH-006. Both are pure `.rodata` print + exit 0, checked via a
