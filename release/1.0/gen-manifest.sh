@@ -63,10 +63,13 @@ for f in "$BIN_PATH" "$REPO_ROOT/caps.decl" "$REPO_ROOT/doc/pkg.pdxdoc"; do
     fi
 done
 
-# deps.list is generated from manifest.pdxproj `deps:` block at release
-# time. If a static deps.list exists in the repo we use it; else we
-# derive one on the fly from manifest.pdxproj so the M5-close artefact
-# is self-contained.
+# deps.list (ENH-011 #36) is a static, committed file mirroring
+# manifest.pdxproj's `deps:` block -- the release manifest is
+# reproducible from the repo alone without depending on the awk
+# derivation below matching manifest.pdxproj's comment formatting at
+# release time. Keep the two in sync by hand when a dep version
+# changes. The derive-on-the-fly fallback stays for a checkout that
+# predates ENH-011 or has deleted deps.list locally.
 if [ -f "$REPO_ROOT/deps.list" ]; then
     DEPS_LIST="$REPO_ROOT/deps.list"
 else

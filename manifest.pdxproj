@@ -42,9 +42,17 @@ sources:
 # --- Library dependencies -----------------------------------------------
 # Only libpdx-argv at M1 (subcommand recognizer uses it to parse flags).
 # libpdx-audit lands at M3-003; libpdx-elevate at M3-004; libpdx-semantic-
-# pipe at M3-001. libpdx-cap is not a direct dep at M1 — the exec-time
+# pipe at M3-001. libpdx-cap is not a direct dep at M1 -- the exec-time
 # manifest verify against caps.decl is loader-side, not tool-side, until
-# libpdx-cap.M2 lands the CAP_MANIFEST_MISSING / EXTRA logic.
+# libpdx-cap.M2 lands the CAP_MANIFEST_MISSING / EXTRA logic. Verified
+# consistent at ENH-011 (#36): caps.decl's cap_manifest_verify comment
+# describes the loader validating pkg's shipped caps.decl, not pkg
+# linking libpdx-cap -- the two docs do not actually contradict.
+#
+# `deps.list` (repo root) is a static, committed mirror of this block
+# (name + version constraint, one per line, no comments) that
+# release/1.0/gen-manifest.sh packages verbatim. Keep both in sync by
+# hand when a dep version changes.
 deps:
   - libpdx-argv @ ^0.1
   - libpdx-audit @ ^0.2           # M3-003: pre-output journal on every subcommand

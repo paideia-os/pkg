@@ -1,0 +1,4 @@
+libpdx-argv @ ^0.1
+libpdx-audit @ ^0.2
+libpdx-semantic-pipe @ ^0.2
+libpdx-elevate @ ^1.0

@@ -17,6 +17,12 @@
 
 The generator is idempotent (given the same source tree and same
 `PDX_STUB_SIG` mode) and reproducible (byte-for-byte across hosts).
+Reproducibility depends on every packaged member being either a
+committed file or a deterministic derivation from one; `../../deps.list`
+(repo root, ENH-011 #36) closes the one gap that existed at M5-close --
+before it landed, `deps.list` was regenerated from `manifest.pdxproj`'s
+`deps:` block at release time, coupling a hashed, packaged artefact to
+that block's comment formatting rather than to a committed file.
 
 ## 2. Invocation
 
