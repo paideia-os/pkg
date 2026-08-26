@@ -14,12 +14,16 @@
 //      If it returns non-zero, print a short usage line on stderr
 //      and return exit code 2 (usage error). M3-002 replaces the
 //      hand-rolled diagnostic with a doc-back-end call.
-//   3. Dispatch::dispatch_reset() — zero chosen_subcommand.
-//   4. Load ParsedArgs::pos_count; if 0 → Dispatch::dispatch_no_
+//   3. pkg_meta_flag_check() (ENH-006 #31) — scan ParsedArgs::
+//      flag_names for a bare "help" or "version" long flag; print
+//      the matching message and return 0 BEFORE dispatch, with or
+//      without a subcommand present.
+//   4. Dispatch::dispatch_reset() — zero chosen_subcommand.
+//   5. Load ParsedArgs::pos_count; if 0 → Dispatch::dispatch_no_
 //      subcommand (which prints the usage line and returns 2).
-//   5. Load ParsedArgs::pos_ptrs[0] and call Dispatch::dispatch_
+//   6. Load ParsedArgs::pos_ptrs[0] and call Dispatch::dispatch_
 //      subcommand(subcmd_ptr).
-//   6. Return the dispatch call's exit code.
+//   7. Return the dispatch call's exit code.
 //
 // paideia-as compliance
 // ---------------------
@@ -40,11 +44,14 @@
 //   ParsedArgs::reset            (libpdx-argv)
 //   ParsedArgs::pos_count        (libpdx-argv .bss)
 //   ParsedArgs::pos_ptrs         (libpdx-argv .bss, [u64;32])
+//   ParsedArgs::flag_count       (libpdx-argv .bss; ENH-006 #31)
+//   ParsedArgs::flag_names       (libpdx-argv .bss, [u64;32]; ENH-006 #31)
 //   ParsedArgs::ERR_OK           (libpdx-argv constant; 0)
 //   Parser::parse_argv           (libpdx-argv)
 //   Dispatch::dispatch_reset     (this repo)
 //   Dispatch::dispatch_subcommand(this repo)
 //   Dispatch::dispatch_no_subcommand (this repo)
+//   Print::print_str             (this repo; ENH-006 #31)
 //   Print::print_err             (this repo)
 
 module Main = structure {
@@ -56,6 +63,125 @@ module Main = structure {
   pub let PARSE_FAIL_MSG : [u8; 39] =
     "pkg: argv parse error (run 'pkg --help')\n"
   pub let PARSE_FAIL_MSG_LEN : u64 = 39
+
+  // -- ENH-006 (#31): --help / --version ---------------------------------
+  // Both are pure .rodata print + exit 0 with zero substrate dependency
+  // -- landable at HEAD unlike almost everything else in the backlog.
+  // Self-contained rather than shelling out to `doc pkg` (the .pdxdoc
+  // route would add a cross-repo runtime dependency for the most basic
+  // possible interaction). --help emits one print_str call per line
+  // (paideia-as string literals do not concatenate; this repo's
+  // established convention -- see REMOVE_STAGE_MSG_1/_2 -- is one
+  // constant per line rather than one giant literal).
+  pub let HELP_LINE_USAGE : [u8; 51] =
+    "usage: pkg <install|remove|list|verify|keys> [ARG]\n"
+  pub let HELP_LINE_USAGE_LEN : u64 = 51
+  pub let HELP_LINE_INSTALL : [u8; 72] =
+    "  install <name>  fetch, dual-verify (ML-DSA-65), and install a package\n"
+  pub let HELP_LINE_INSTALL_LEN : u64 = 72
+  pub let HELP_LINE_REMOVE : [u8; 70] =
+    "  remove <name>   remove an installed package (writes an undo record)\n"
+  pub let HELP_LINE_REMOVE_LEN : u64 = 70
+  pub let HELP_LINE_LIST : [u8; 42] =
+    "  list            list installed packages\n"
+  pub let HELP_LINE_LIST_LEN : u64 = 42
+  pub let HELP_LINE_VERIFY : [u8; 60] =
+    "  verify <name>   re-verify an installed package signatures\n"
+  pub let HELP_LINE_VERIFY_LEN : u64 = 60
+  pub let HELP_LINE_KEYS : [u8; 48] =
+    "  keys            show the trusted signing keys\n"
+  pub let HELP_LINE_KEYS_LEN : u64 = 48
+  pub let HELP_LINE_HELP : [u8; 36] =
+    "  --help          show this message\n"
+  pub let HELP_LINE_HELP_LEN : u64 = 36
+  pub let HELP_LINE_VERSION : [u8; 35] =
+    "  --version       show the version\n"
+  pub let HELP_LINE_VERSION_LEN : u64 = 35
+
+  // Mirrors manifest.pdxproj's `version` field. Kept as a literal
+  // rather than read from manifest.pdxproj at build time (no reader
+  // for that file exists in this tool); bump alongside version bumps.
+  pub let VERSION_MSG : [u8; 10] = "pkg 1.0.0\n"
+  pub let VERSION_MSG_LEN : u64 = 10
+
+  // Meta-flag scan results.
+  pub let MFC_NONE    : u64 = 0
+  pub let MFC_HELP    : u64 = 1
+  pub let MFC_VERSION : u64 = 2
+
+  // ==========================================================================
+  // pkg_meta_flag_check() -> MFC_NONE | MFC_HELP | MFC_VERSION
+  //
+  // Scan ParsedArgs::flag_names[0..flag_count) for a bare "help" or
+  // "version" entry (libpdx-argv's long-flag parser stores the name
+  // ptr starting AFTER the leading "--", NUL-terminated in place --
+  // see libpdx-argv's Parser::parse_argv "name ptr = argv_ptr + 2").
+  // pkg registers no FlagSpec entries, so flag_ids/flag_kinds carry no
+  // useful classification here; this is a direct byte compare against
+  // the two literals pkg cares about, same idiom as the inline
+  // "pdx-schema" compare in libpdx-argv's own parser.
+  //
+  // Called before dispatch so --help / --version work with or without
+  // a subcommand present (bare `pkg --help` today falls through to
+  // dispatch_no_subcommand and exits 2; this check runs first).
+  //
+  // Register plan (leaf; no nested calls):
+  //   rbx = loop index k (pushed/popped -- callee-save)
+  //   rcx = flag_count (loaded once)
+  //   rdx = flag_names[k] (candidate name ptr)
+  //   rax = byte-compare scratch / return value
+  // ==========================================================================
+  pub let pkg_meta_flag_check : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.ENH-006 (#31) pkg_meta_flag_check: scan ParsedArgs::flag_names[0..flag_count) for a bare 'help' or 'version' long flag (name ptr already skips the leading '--' per libpdx-argv's parser). One push (rbx=loop index k); leaf, no nested calls, so alignment is irrelevant. Each candidate is byte-compared against the literal 'help\\0' (5 bytes) or 'version\\0' (8 bytes) via the #1248 mitigation (xor rax,rax; mov_b rax,[ptr]) -- mirrors remove.pdx's name-walk and libpdx-argv's own inline pdx-schema compare. First match wins; MFC_NONE (0) if flag_count entries are exhausted without a match. All immediates (byte literals, MFC_* constants, MAX_FLAGS=32 implicit via flag_count) are within cmp reg,imm <= 0x7FFFFFFF. Labels prefixed mfc_.",
+      block: {
+        push rbx;
+
+        lea r11, [rip + flag_count];
+        mov rcx, [r11];
+        xor rbx, rbx;
+
+      mfc_loop:
+        cmp rbx, rcx;
+        jae mfc_none;
+
+        lea r11, [rip + flag_names];
+        mov rdx, [r11 + rbx*8];
+
+        // ---- compare against "help\0" ----
+        xor rax, rax; mov_b rax, [rdx + 0]; cmp rax, 0x68; jne mfc_try_version;  // 'h'
+        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x65; jne mfc_try_version;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x6C; jne mfc_try_version;  // 'l'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x70; jne mfc_try_version;  // 'p'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0;    jne mfc_try_version;  // NUL
+        mov rax, 1;                          // MFC_HELP
+        pop rbx;
+        ret;
+
+      mfc_try_version:
+        xor rax, rax; mov_b rax, [rdx + 0]; cmp rax, 0x76; jne mfc_advance;  // 'v'
+        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x65; jne mfc_advance;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x72; jne mfc_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x73; jne mfc_advance;  // 's'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x69; jne mfc_advance;  // 'i'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x6F; jne mfc_advance;  // 'o'
+        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x6E; jne mfc_advance;  // 'n'
+        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0;    jne mfc_advance;  // NUL
+        mov rax, 2;                          // MFC_VERSION
+        pop rbx;
+        ret;
+
+      mfc_advance:
+        add rbx, 1;
+        jmp mfc_loop;
+
+      mfc_none:
+        xor rax, rax;                        // MFC_NONE
+        pop rbx;
+        ret
+      }
+    }
 
   // ============================================================================
   // pkg_main(argc, argv) -> exit_code
@@ -84,7 +210,7 @@ module Main = structure {
   pub let pkg_main : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (argc: u64) (argv: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "pkg.M1-002 pkg_main. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: parse via libpdx-argv → dispatch on ParsedArgs::pos_ptrs[0]. 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (Parser::parse_argv, ParsedArgs::reset, Dispatch::*, Print::print_err). rbx/r12 preserved across every nested call — the callee-save contract from SysV holds through libpdx-argv (see its Parser::parse_argv justification which declares leaf semantics). Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE. Zero-positional path: delegates to Dispatch::dispatch_no_subcommand which owns the usage-message print. Otherwise: dispatch on pos_ptrs[0]. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. Return: pop the pad, pop r12, pop rbx, ret with rax carrying the dispatched body's exit code (or 2 on parse-fail).",
+      justification: "pkg.M1-002 pkg_main, widened at ENH-006 (#31). Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: parse via libpdx-argv -> pkg_meta_flag_check (ENH-006: --help/--version short-circuit, BEFORE dispatch_reset, so both work with or without a subcommand or positional present) -> dispatch on ParsedArgs::pos_ptrs[0]. 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (Parser::parse_argv, ParsedArgs::reset, pkg_meta_flag_check, Dispatch::*, Print::print_str, Print::print_err). rbx/r12 preserved across every nested call -- the callee-save contract from SysV holds through libpdx-argv and pkg_meta_flag_check alike. Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE. --help path: eight sequential print_str calls (one per HELP_LINE_* constant -- paideia-as string literals do not concatenate, so this repo's one-constant-per-line convention applies here too); return 0. --version path: one print_str of VERSION_MSG; return 0. Zero-positional path (no meta-flag matched): delegates to Dispatch::dispatch_no_subcommand which owns the usage-message print. Otherwise: dispatch on pos_ptrs[0]. All immediates within cmp reg,imm <= 0x7FFFFFFF. Return: pop the pad, pop r12, pop rbx, ret with rax carrying the dispatched body's exit code (or 2 on parse-fail, 0 on --help/--version).",
       block: {
         // Prologue: preserve argc/argv, align stack.
         push rbx;                              // rsp%16: 8 → 0
@@ -115,6 +241,16 @@ module Main = structure {
         jmp pkg_main_epilogue;
 
       pkg_main_parse_ok:
+        // ENH-006 (#31): --help / --version short-circuit BEFORE
+        // dispatch, so they work with or without a subcommand present
+        // (and without a positional argument, which today falls
+        // through to dispatch_no_subcommand and exits 2).
+        call pkg_meta_flag_check;
+        cmp rax, 1;                            // MFC_HELP
+        je  pkg_main_help;
+        cmp rax, 2;                            // MFC_VERSION
+        je  pkg_main_version;
+
         // Step 4: reset dispatch state.
         call dispatch_reset;
 
@@ -133,6 +269,42 @@ module Main = structure {
         lea r11, [rip + pos_ptrs];
         mov rdi, [r11 + 0];                    // pos_ptrs[0] = subcmd name ptr
         call dispatch_subcommand;
+        jmp pkg_main_epilogue;
+
+      pkg_main_help:
+        lea rdi, [rip + HELP_LINE_USAGE];
+        mov rsi, 51;                           // HELP_LINE_USAGE_LEN
+        call print_str;
+        lea rdi, [rip + HELP_LINE_INSTALL];
+        mov rsi, 72;                           // HELP_LINE_INSTALL_LEN
+        call print_str;
+        lea rdi, [rip + HELP_LINE_REMOVE];
+        mov rsi, 70;                           // HELP_LINE_REMOVE_LEN
+        call print_str;
+        lea rdi, [rip + HELP_LINE_LIST];
+        mov rsi, 42;                           // HELP_LINE_LIST_LEN
+        call print_str;
+        lea rdi, [rip + HELP_LINE_VERIFY];
+        mov rsi, 60;                           // HELP_LINE_VERIFY_LEN
+        call print_str;
+        lea rdi, [rip + HELP_LINE_KEYS];
+        mov rsi, 48;                           // HELP_LINE_KEYS_LEN
+        call print_str;
+        lea rdi, [rip + HELP_LINE_HELP];
+        mov rsi, 36;                           // HELP_LINE_HELP_LEN
+        call print_str;
+        lea rdi, [rip + HELP_LINE_VERSION];
+        mov rsi, 35;                           // HELP_LINE_VERSION_LEN
+        call print_str;
+        xor rax, rax;                          // EXIT_OK
+        jmp pkg_main_epilogue;
+
+      pkg_main_version:
+        lea rdi, [rip + VERSION_MSG];
+        mov rsi, 10;                           // VERSION_MSG_LEN
+        call print_str;
+        xor rax, rax;                          // EXIT_OK
+        jmp pkg_main_epilogue;
 
       pkg_main_epilogue:
         // Restore stack, return with rax carrying the exit code.

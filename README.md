@@ -76,14 +76,18 @@ so the pipelines are wired end to end but halt at named seams. See
 
 ## Options
 
-pkg's own source reads **no flags**. It consumes only `ParsedArgs::pos_count`
-and `ParsedArgs::pos_ptrs[]` from libpdx-argv; there is no reference to
-`flag_names[]` anywhere in `src/`. Flags are still *parsed* by libpdx-argv
+`pkg_main` reads `ParsedArgs::flag_names[]` for exactly two flags —
+`--help` and `--version` (ENH-006 #31) — via `PkgMain::pkg_meta_flag_check`,
+a direct byte scan (pkg registers no `FlagSpec` entries, so there is no
+id-based lookup to hook). Both short-circuit before subcommand dispatch,
+work with or without a positional argument, and exit 0. Every other
+subcommand body still consumes only `ParsedArgs::pos_count` and
+`ParsedArgs::pos_ptrs[]`. Flags are still *parsed* by libpdx-argv
 (long-form `--flag`, `--flag=value` or `--flag value`; single short flags
 `-f`; clustered `-abc` is rejected as `ERR_CLUSTERED_SHORT`, surfacing as
-exit 2), but no flag has a body wired at 1.0.0. The reserved I3 vocabulary
-is listed in `design/argv-surface.md` §4 and `doc/pkg.pdxdoc`; passing any
-of it parses cleanly and has no observable effect.
+exit 2), but no other flag has a body wired at 1.0.0. The reserved I3
+vocabulary is listed in `design/argv-surface.md` §4 and `doc/pkg.pdxdoc`;
+passing any of it parses cleanly and has no observable effect.
 
 What *is* enforced per subcommand is positional arity.
 
@@ -253,6 +257,27 @@ $ pkg verify
 pkg verify: body not implemented at M1 (lands at M2)
 $ echo $?
 3
+```
+
+`--help` and `--version` (ENH-006 #31) work with no subcommand present
+and exit 0 — the only two flags with a real body at 1.0.0:
+
+```
+$ pkg --version
+pkg 1.0.0
+$ echo $?
+0
+$ pkg --help
+usage: pkg <install|remove|list|verify|keys> [ARG]
+  install <name>  fetch, dual-verify (ML-DSA-65), and install a package
+  remove <name>   remove an installed package (writes an undo record)
+  list            list installed packages
+  verify <name>   re-verify an installed package signatures
+  keys            show the trusted signing keys
+  --help          show this message
+  --version       show the version
+$ echo $?
+0
 ```
 
 ## Audit records

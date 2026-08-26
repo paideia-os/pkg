@@ -89,23 +89,30 @@ For pkg, the following long flags are recognised by libpdx-argv at M1
 (the flag names appear in `ParsedArgs::flag_names[]`); the flag bodies
 land in later milestones:
 
-| Flag           | M1 status  | Wired at | Behaviour                                                            |
-|----------------|------------|----------|----------------------------------------------------------------------|
-| `--help`       | recognised | M3-002   | `doc pkg --help`; requires `doc` at M2                               |
-| `--version`    | recognised | M2       | prints `pkg <version> (build <hash>) sig <fingerprint>`              |
-| `--dry-run`    | recognised | M2       | previews the effect on install/remove without writing                |
-| `--json`       | recognised | M3-001   | emit `PackageManifest[]` etc. as JSON on stdout, suppressing text    |
-| `--schema`     | recognised | M3-001   | print the subcommand's output schema definition and exit             |
-| `--verbose`    | recognised | M3-003   | additional diagnostic output on stderr, including audit-record ids   |
-| `--pdx-schema` | recognised | M3-001   | libpdx-argv's well-known flag; sets `emit_schema=1` in ParsedArgs    |
+| Flag           | Status     | Wired at   | Behaviour                                                            |
+|----------------|------------|------------|------------------------------------------------------------------------|
+| `--help`       | **wired**  | ENH-006 #31 | self-contained usage print (no `doc` dependency); short-circuits before dispatch; exit 0 |
+| `--version`    | **wired**  | ENH-006 #31 | prints `pkg 1.0.0`; short-circuits before dispatch; exit 0            |
+| `--dry-run`    | recognised | reserved   | previews the effect on install/remove without writing (ENH-007 #32, blocked on ENH-001 #26) |
+| `--json`       | recognised | reserved   | emit `PackageManifest[]` etc. as JSON on stdout, suppressing text    |
+| `--schema`     | recognised | reserved   | print the subcommand's output schema definition and exit             |
+| `--verbose`    | recognised | reserved   | additional diagnostic output on stderr, including audit-record ids   |
+| `--pdx-schema` | recognised | M3-001     | libpdx-argv's well-known flag; sets `emit_schema=1` in ParsedArgs    |
 
-At M1 all of these flags are recognised by libpdx-argv (they are long-
-form and follow the grammar); pkg's own dispatch does not read from
-`ParsedArgs::flag_names[]` at M1 and therefore does not enforce any
-flag body. Passing `--json` at M1 succeeds at parse and has no
-observable effect — the M3 body wires it. This is deliberate for
-"first-runnable shape": the argv surface is stable, the flag bodies
-fill in behind it without breaking existing call sites.
+`--help` and `--version` are the only two flags with a real body at
+1.0.0 + ENH-006. Both are pure `.rodata` print + exit 0, checked via a
+direct scan of `ParsedArgs::flag_names[]` in `pkg_main` (pkg registers
+no `FlagSpec` entries, so this is a byte compare, not an id lookup) --
+`PkgMain::pkg_meta_flag_check` in `src/main.pdx`. Every other flag in
+the table above is still recognised by libpdx-argv at parse time (long-
+form, follows the grammar) but has no body: pkg's own dispatch does not
+read `ParsedArgs::flag_names[]` for them, so passing `--json` today
+succeeds at parse and has no observable effect. Per the ENH-002 (#27)
+audit, `--json` / `--schema` stay reserved-and-unwired until `list` /
+`install` emit live records rather than one demo record; `--color=`,
+`--quiet`, `--no-cap:<name>` are not part of this repo's own reserved
+vocabulary at all (see `enhancement-plan.md` §2.2) and should not
+appear in `.pdxdoc` as if they were.
 
 ## 5. Exit codes
 

@@ -29,9 +29,14 @@ Subcommands (M5 vocabulary):
 - verify  <name>                 -- re-verify an installed package's signatures
 - keys    list                   -- list the signing keys pkg trusts
 
-Standard I3 flags (all subcommands): --help, --version, --dry-run,
---json, --schema, --verbose, --quiet, --color={always|auto|never},
---no-cap:<name>.
+pkg --help                       -- print usage + one line per subcommand
+pkg --version                    -- print "pkg 1.0.0"
+
+--help and --version are wired at the top level (ENH-006 #31): they
+short-circuit before subcommand dispatch and work with or without a
+subcommand or positional argument present. No other flag has a body
+wired at 1.0.0 (see README.md's capabilities section and ENH-002 for
+the reserved-but-unwired I3 vocabulary).
 
 DESCRIPTION
 
