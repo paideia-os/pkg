@@ -49,7 +49,9 @@ deps:
   - libpdx-argv @ ^0.1
   - libpdx-audit @ ^0.2           # M3-003: pre-output journal on every subcommand
   - libpdx-semantic-pipe @ ^0.2   # M3-001 + M3-002: schema-typed stdout for list + install
-  - libpdx-elevate @ ^0.2         # M3-004: KIND_PDXFS_FILE(write,/pkgs) 60s window
+  - libpdx-elevate @ ^1.0         # M3-004/ENH-008: KIND_PDXFS_FILE(write,/pkgs) 60s window;
+                                  # bumped from ^0.2 -- libpdx-elevate 1.1.0 renamed
+                                  # elevate_client_request -> elevate_client_request_norealize
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49 tool observes and every M1 file

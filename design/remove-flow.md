@@ -25,13 +25,18 @@ remove would violate I5.
 Step 1  remove_reset
 Step 1a assign monotonic remove_id (remove_id_next)
 Step 1b progress diagnostic ("removing name '<name>'")
-Step 2  look up /system/packages/<name>-* (SEAM -- no readdir at HEAD)
-Step 3  TxnClient::txn_open(TXN_MODE_DELETE) (SEAM)
-Step 4  serialise pdxundo header + FILE_TRASH_ENTRY body
+Step 2  PkgElevate::pkg_elevate_request_pdxfs_write_pkgs -- request a
+         60s KIND_PDXFS_FILE(write, /pkgs) cap (ENH-008 #33; result in
+         remove_parent_slot). Wired ahead of the lookup gate so remove
+         never gains a live unelevated destructive path once it
+         closes; broker unregistered today (R48-PREP-005) -> slot 0.
+Step 3  look up /system/packages/<name>-* (SEAM -- no readdir at HEAD)
+Step 4  TxnClient::txn_open(TXN_MODE_DELETE, parent_slot=remove_parent_slot) (SEAM)
+Step 5  serialise pdxundo header + FILE_TRASH_ENTRY body
          (header REAL at M2; body deferred to M4)
-Step 5  move /pkgs/<name>-<version>/ into /system/trash/<remove_id>-*
+Step 6  move /pkgs/<name>-<version>/ into /system/trash/<remove_id>-*
          via per-file txn writes (SEAM)
-Step 6  TxnClient::txn_commit (SEAM)
+Step 7  TxnClient::txn_commit (SEAM)
         |
         v
      exit 0
@@ -100,12 +105,13 @@ same discipline at M3+.
 
 ## 5. Remove-progress .bss slots
 
-| Slot               | Meaning                                     |
-|--------------------|---------------------------------------------|
-| `remove_name_ptr`  | pos_ptrs[1]                                 |
-| `remove_id`        | monotonic remove-id assigned this call      |
-| `remove_txn_slot`  | KIND_PDXFS_TXN cap slot (0 if never opened) |
-| `remove_step`      | last step index reached (0..5)              |
+| Slot                 | Meaning                                       |
+|----------------------|------------------------------------------------|
+| `remove_name_ptr`    | pos_ptrs[1]                                     |
+| `remove_id`          | monotonic remove-id assigned this call          |
+| `remove_txn_slot`    | KIND_PDXFS_TXN cap slot (0 if never opened)     |
+| `remove_parent_slot` | elevate-granted parent_slot (0 = unavailable, ENH-008 #33) |
+| `remove_step`        | last step index reached (0..6)                  |
 
 `_remove_id_counter` is a process-lifetime monotonic. `remove_reset`
 does NOT clear it — the M4 test harness resets it explicitly when it
@@ -115,6 +121,11 @@ wants a clean slate.
 
 Same discipline as install (see `design/install-flow.md` §3):
 
+- **Elevate seam** — `PkgElevate::pkg_elevate_request_pdxfs_write_pkgs`
+  resolves `svc.elevate-broker` but the broker is not registered at
+  paideia-os HEAD (R48-PREP-005), so the request never dispatches and
+  `remove_parent_slot` stays `0` (ENH-008 #33). Wired ahead of the
+  lookup seam below on purpose, matching install's ordering.
 - **Lookup seam** — `/system/packages/` readdir is not exposed at
   paideia-os HEAD. M3 either wires a readdir extension on
   `KIND_PDXFS_FILE` OR reads `/system/packages/index.pdxlist` (a

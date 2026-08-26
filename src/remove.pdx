@@ -13,20 +13,27 @@
 // seam-discipline as install:
 //
 //   1. Read pos_ptrs[1] (name); pos_count must be 2.
-//   2. Look up the installed version via /system/packages/<name>-*
+//   2. Request a bounded-lifetime KIND_PDXFS_FILE(write, /pkgs) cap via
+//      PkgElevate::pkg_elevate_request_pdxfs_write_pkgs (ENH-008 #33 --
+//      same wrapper install uses; result in remove_parent_slot). Wired
+//      ahead of the lookup gate closing so remove never gains a live
+//      unelevated destructive path.
+//   3. Look up the installed version via /system/packages/<name>-*
 //      (STUB at M2 -- KIND_PDXFS_FILE has no readdir op; the M2 shape
 //      hard-codes a lookup miss which fails-safe).
-//   3. Open KIND_PDXFS_TXN(mode=DELETE) via TxnClient::txn_open (SEAM).
-//   4. Serialise the reverse-symlink undo record into the process's
+//   4. Open KIND_PDXFS_TXN(mode=DELETE) via TxnClient::txn_open (SEAM),
+//      threading remove_parent_slot the same way install threads
+//      install_parent_slot.
+//   5. Serialise the reverse-symlink undo record into the process's
 //      undo-scratch buffer (REAL byte layout at M2 -- shape is stable).
-//   5. Move /pkgs/<name>-<version>/ into
+//   6. Move /pkgs/<name>-<version>/ into
 //      /system/trash/<remove_id>-<name>-<version>/ via a per-file txn
 //      write per the parent's FILE_INVENTORY (STUB at M2 -- one write
 //      per record shape lives at M4 alongside the fixture manifest).
-//   6. Write the undo record to /journal/pkg/remove-<remove_id>.pdxundo
+//   7. Write the undo record to /journal/pkg/remove-<remove_id>.pdxundo
 //      (STUB at M2 -- KIND_PDXFS_FILE write op deferred to R42-PREP-007).
-//   7. Commit txn.
-//   8. Exit 0.
+//   8. Commit txn.
+//   9. Exit 0.
 //
 //   On failure: txn_abort; exit 1 (EXIT_OP_FAIL) with a diagnostic
 //   naming the failing step.
@@ -106,12 +113,21 @@ module Remove = structure {
   pub let mut remove_txn_slot     : u64 = uninit @align(8)
   pub let mut remove_step         : u64 = uninit @align(8)
 
+  // ENH-008 (#33): parent_slot returned by PkgElevate::
+  // pkg_elevate_request_pdxfs_write_pkgs. Mirrors install_parent_slot
+  // in src/install.pdx -- 0 (PE_PARENT_UNAVAILABLE) until the elevate
+  // broker is registered (paideia-os R48-PREP-005); a future real
+  // txn_open(DELETE) call threads this slot the same way install's
+  // txn_open does.
+  pub let mut remove_parent_slot  : u64 = uninit @align(8)
+
   pub let REMOVE_STEP_NONE     : u64 = 0
-  pub let REMOVE_STEP_LOOKUP   : u64 = 1
-  pub let REMOVE_STEP_TXN_OPEN : u64 = 2
-  pub let REMOVE_STEP_UNDO     : u64 = 3
-  pub let REMOVE_STEP_TRASH    : u64 = 4
-  pub let REMOVE_STEP_COMMIT   : u64 = 5
+  pub let REMOVE_STEP_ELEVATE  : u64 = 1
+  pub let REMOVE_STEP_LOOKUP   : u64 = 2
+  pub let REMOVE_STEP_TXN_OPEN : u64 = 3
+  pub let REMOVE_STEP_UNDO     : u64 = 4
+  pub let REMOVE_STEP_TRASH    : u64 = 5
+  pub let REMOVE_STEP_COMMIT   : u64 = 6
 
   // Monotonic remove-id counter -- one per process invocation is enough
   // since pkg is a single-subcommand process at M2, but incrementing
@@ -133,13 +149,14 @@ module Remove = structure {
   pub let remove_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "pkg.M2-004 remove_reset: zero every remove-progress slot. _remove_id_counter is NOT zeroed here -- it is a process-lifetime monotonic; the M4 test harness resets it explicitly when it wants a clean slate. Leaf function.",
+      justification: "pkg.M2-004 remove_reset, widened at ENH-008 (#33): zero every remove-progress slot, including remove_parent_slot so a leftover elevate grant from a previous call cannot leak into a fresh txn_open. _remove_id_counter is NOT zeroed here -- it is a process-lifetime monotonic; the M4 test harness resets it explicitly when it wants a clean slate. Leaf function.",
       block: {
         xor rax, rax;
-        lea r11, [rip + remove_name_ptr];  mov [r11], rax;
-        lea r11, [rip + remove_id];        mov [r11], rax;
-        lea r11, [rip + remove_txn_slot];  mov [r11], rax;
-        lea r11, [rip + remove_step];      mov [r11], rax;
+        lea r11, [rip + remove_name_ptr];    mov [r11], rax;
+        lea r11, [rip + remove_id];          mov [r11], rax;
+        lea r11, [rip + remove_txn_slot];    mov [r11], rax;
+        lea r11, [rip + remove_step];        mov [r11], rax;
+        lea r11, [rip + remove_parent_slot]; mov [r11], rax;
         ret
       }
     }
@@ -246,7 +263,7 @@ module Remove = structure {
   pub let pkg_remove_body : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "pkg.M3-003 pkg_remove_body. M3 upgrade over M2: audit-first via AuditWire::audit_begin_op BEFORE any output. Broker unavailable -> exit 3 without touching stdout/stderr. audit_id lands in _remove_audit_id .bss so epilogue commits without register-pressure hassle. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient. Full pipeline (shape unchanged): pos_ptrs[1] check -> monotonic remove_id -> lookup SEAM (no readdir at HEAD) -> txn_open(DELETE) -> serialise undo header + body -> trash-move SEAM -> txn_commit. Silent-remove-without-audit would violate I5 as well as I5's undo obligation. Cleanup: txn_abort on any failure. Five callee-save pushes flip rsp%16 8->0. Labels prefixed pr_.",
+      justification: "pkg.M3-003 pkg_remove_body, widened at ENH-008 (#33): audit-first via AuditWire::audit_begin_op BEFORE any output. Broker unavailable -> exit 3 without touching stdout/stderr. audit_id lands in _remove_audit_id .bss so epilogue commits without register-pressure hassle. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient / PkgElevate. Full pipeline (ENH-008 inserts the elevate stage ahead of lookup): pos_ptrs[1] check -> monotonic remove_id -> PkgElevate::pkg_elevate_request_pdxfs_write_pkgs (result in remove_parent_slot; 0 today, no output) -> lookup SEAM (no readdir at HEAD) -> txn_open(DELETE) -> serialise undo header + body -> trash-move SEAM -> txn_commit. Silent-remove-without-audit would violate I5 as well as I5's undo obligation; silent-remove-without-elevate would violate D4 (no ambient /pkgs write authority) the moment the lookup gate closes. Cleanup: txn_abort on any failure. Five callee-save pushes flip rsp%16 8->0. Labels prefixed pr_.",
       block: {
         push rbx;
         push r12;
@@ -314,12 +331,32 @@ module Remove = structure {
         mov rsi, 2;                          // REMOVE_STAGE_MSG_2_LEN
         call print_str;
 
+        // ---- ENH-008 (#33): elevate for KIND_PDXFS_FILE(write, /pkgs) --
+        // Ask libpdx-elevate for the same bounded-lifetime /pkgs write
+        // cap install requests, BEFORE the lookup/txn_open stages that
+        // will consume it. remove is destructive (trash-move + DELETE
+        // txn) and D4 forbids ambient write authority on /pkgs for any
+        // mutating path, not install alone. Wired here -- ahead of the
+        // /system/packages/ readdir gate closing -- so remove never
+        // gains a live unelevated destructive path once that gate
+        // lands; a silent grant-then-write ordering bug would be much
+        // harder to catch after the fact than a stage that already
+        // exists and simply returns 0 today. No output; result stored
+        // in remove_parent_slot for the eventual txn_open(DELETE).
+        mov r11, 1;                          // REMOVE_STEP_ELEVATE
+        lea rax, [rip + remove_step];
+        mov [rax], r11;
+
+        call pkg_elevate_request_pdxfs_write_pkgs;
+        lea r11, [rip + remove_parent_slot];
+        mov [r11], rax;                      // 0 today; live slot post-M2
+
         // Step 2: lookup /system/packages/<name>-* -- SEAM.
         // KIND_PDXFS_FILE at HEAD has no readdir; this step
         // unconditionally refuses at M2 with a diagnostic naming the
         // missing substrate. M3 wires the readdir extension OR reads
         // /system/packages/index.pdxlist per architecture.md §M2.
-        mov r11, 1;                          // REMOVE_STEP_LOOKUP
+        mov r11, 2;                          // REMOVE_STEP_LOOKUP
         lea rax, [rip + remove_step];
         mov [rax], r11;
 

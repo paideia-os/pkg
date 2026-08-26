@@ -466,12 +466,15 @@ module Install = structure {
 
         // Success: rax in [0, 256). Any rax >= 256 is a mint sentinel
         // (0xFFFFEC1x band) or -ENFILE (0xFFFFFFFFFFFFFFDF). PXT_MINT_
-        // BAD_PARENT (0xFFFFEC2D) is the one we expect at M3 while
-        // libpdx-elevate.M2 still returns ELVC_STUB from its request
-        // path -- diagnostic-branch on it so a maintainer knows the
-        // elevate reply is the missing piece rather than a txn-model
-        // bug. All other high-band returns hit the generic TXN error
-        // path.
+        // BAD_PARENT (0xFFFFEC2D) is the one we expect while
+        // pkg_elevate_request_pdxfs_write_pkgs still returns
+        // PE_PARENT_UNAVAILABLE (0) -- ElevateClient::
+        // elevate_client_request_norealize never dispatches, and the
+        // broker itself remains unregistered (paideia-os
+        // R48-PREP-005) -- diagnostic-branch on it so a maintainer
+        // knows the elevate reply is the missing piece rather than a
+        // txn-model bug. All other high-band returns hit the generic
+        // TXN error path.
         mov r11, 256;                        // TXN_SLOT_CAP_MAX
         cmp r14, r11;
         jb  pi_txn_open_ok;

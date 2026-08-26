@@ -51,14 +51,17 @@ until both signatures verify.
 
 **Elevate integration.** pkg never carries ambient write authority on
 `/pkgs`. Its `caps.decl` baseline grants read-only authority on
-`/system/packages/` and nothing more. Only `install` elevates: between the
-manifest-mint and transaction-open stages, `pkg_elevate_request_pdxfs_write_pkgs`
-asks `svc.elevate-broker` (over `KIND_ELEVATE_CHANNEL`) for
+`/system/packages/` and nothing more. `install` and `remove` both
+elevate — install between the manifest-mint and transaction-open
+stages, remove before its (currently seam-gated) lookup stage — via
+the shared `pkg_elevate_request_pdxfs_write_pkgs` wrapper, which asks
+`svc.elevate-broker` (over `KIND_ELEVATE_CHANNEL`) for
 `KIND_PDXFS_FILE(write, /pkgs)` with a **60-second** window
 (`PE_DURATION_60S_NS = 60000000000`). The broker returns a `parent_slot`
 in `[1, 256)`, which is threaded into `TxnClient::txn_open`; every failure
 collapses to slot `0`, and `txn_open` then refuses with
-`PXT_MINT_BAD_PARENT`. `list`, `remove`, `verify` and `keys` never elevate.
+`PXT_MINT_BAD_PARENT`. `list`, `verify` and `keys` never elevate — they
+never mutate `/pkgs`.
 
 **Audit-first.** Every subcommand body calls `AuditWire::audit_begin_op`
 *before* any byte reaches stdout or stderr. If the audit broker is
