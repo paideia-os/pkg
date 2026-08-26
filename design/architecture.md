@@ -11,6 +11,12 @@ for the D4 install-model contract (dual-signed manifests, source
 fallback, per-install elevate) and for the KIND_PACKAGE_MANIFEST /
 KIND_PACKAGE_REPO allocations landing at M2.
 
+**ENH-001 (#26, 2026-08-25):** the R49 shape described in this document
+is the surviving design against the open "R70 — pkg MVP" milestone
+(#18-#25), which originally proposed replacing it. See
+`design/enh-001-reconciliation.md` for the full disposition; nothing
+in this document changes as a result.
+
 ## 1. Milestone position
 
 M1 lands the frame: the argv surface, the subcommand routing, the

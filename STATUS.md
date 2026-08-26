@@ -1,6 +1,6 @@
 # pkg — status
 
-**Wave:** R49 (Wave 1)
+**Wave:** R49 (Wave 1); Enhancement v1.x (milestone 7, in progress)
 **Current milestone:** M5 (1.0 signed release) — CLOSED.
 All 17 issues (#1-#17) landed across M1-M5. Ready for git tag
 `pkg-v1.0.0`.
@@ -9,6 +9,20 @@ All 17 issues (#1-#17) landed across M1-M5. Ready for git tag
 state STUB at M5-close (v0.33-crypto-kdf gate); diff-flip when the
 crypto substrate lands. See `release/1.0/README.md` §3 and
 `release/mirror-push.md` §7 for substrate-gate carry-forward.
+
+**Post-1.0.0 (Enhancement v1.x, milestone 7):** `design/enhancement-plan.md`
+is the audit that opened this milestone (#26-#38). ENH-001 (#26,
+`design/enh-001-reconciliation.md`) settled the conflict between this
+shipped design and the open "R70 — pkg MVP" milestone (#18-#25): R70
+is reoriented to extend the R49 codec (dual-signed `manifest.pdxsig`,
+`/pkgs/<name>-<version>/` install root, `/system/packages/index.pdxlist`)
+with an additive local-filesystem-path repo source, rather than
+replacing it with a single-signature `.pdxpkg` format. Landed so far:
+ENH-002 (#27, `.pdxdoc` reconciliation), ENH-003 (#28, exit code 4
+split from 3), ENH-006 (#31, `--help`/`--version`), ENH-008 (#33,
+elevate coverage on `remove` + libpdx-elevate rename follow), ENH-011
+(#36, static `deps.list`), ENH-012 (#37, `audit_record_op_output`
+wired).
 
 ## Milestone rollup
 

@@ -292,6 +292,20 @@ until both signatures verify. This is D4 audit-first as it applies to
 `pkg install` — the audit journal records the outcome, not a partial
 progress trail.
 
+## 5.5 ENH-001 (#26): this format is the survivor
+
+The open "R70 — pkg MVP" milestone (#18-#25) originally proposed a
+distinct `<name>-<version>.pdxpkg` JSON-ish manifest with a single
+"stub-to-trust-local" signature, replacing this format. `design/
+enh-001-reconciliation.md` (2026-08-25) settled that conflict: this
+`manifest.pdxsig` codec is kept, unchanged, as the one trust-carrying
+manifest format. R70's local-filesystem-path repo idea is reoriented
+to be an additive *source* pkg resolves `install <name>` against
+ahead of the network mirror -- it still resolves to a `manifest.pdxsig`
++ `pkg.tar` pair that this codec reads and dual-verifies exactly as
+described above. `<name>-<version>.pdxpkg` survives only as the repo
+*index entry* format (a pointer record), not a manifest.
+
 ## 6. Evolution rules
 
 The format is designed to grow across R49-R51+ without breaking
