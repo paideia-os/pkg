@@ -17,9 +17,14 @@
 // Wire pattern per subcommand body:
 //
 //   audit_id = AuditWire::audit_begin_op(OP_NAME_PTR, OP_ARGS_PTR)
-//   if audit_id == 0: exit 3 (I4 discipline -- broker unavailable
-//                             refuses tool output rather than
-//                             emitting un-journalled bytes).
+//   if audit_id == 0: exit 4 (AUDIT_EXIT_BROKER_FAIL -- I4 discipline;
+//                             broker unavailable refuses tool output
+//                             rather than emitting un-journalled
+//                             bytes). Distinct from exit 3
+//                             (EXIT_NOT_YET_IMPLEMENTED, a recognised
+//                             subcommand with no body yet) since
+//                             ENH-003 (#28) -- a caller could not tell
+//                             "no body" from "un-auditable" before.
 //   ... (subcommand body -- output emission) ...
 //   AuditWire::audit_record_op_output(audit_id, SCHEMA_HASH_PTR)
 //       (optional; skip for text-only subcommands)
@@ -29,10 +34,11 @@
 //
 // AuditClient's own gates (state-machine + id-match) enforce that a
 // caller cannot skip audit_begin and go straight to audit_commit; a
-// broker-unavailable audit_begin returns 0 and the caller MUST exit 3
-// to keep I5 intact. This wrapper module documents that contract with
-// the AUDIT_EXIT_BROKER_FAIL constant so the return path is visually
-// distinct at every caller.
+// broker-unavailable audit_begin returns 0 and the caller MUST exit 4
+// (AUDIT_EXIT_BROKER_FAIL) to keep I5 intact. This wrapper module
+// documents that contract with the AUDIT_EXIT_BROKER_FAIL constant so
+// the return path is visually distinct at every caller, and so it no
+// longer collides with EXIT_NOT_YET_IMPLEMENTED (3, ENH-003 #28).
 //
 // paideia-as compliance
 // ---------------------
@@ -56,10 +62,15 @@ module AuditWire = structure {
   pub let OP_NAME_KEYS    : [u8; 5] = "keys\0"
 
   // ---- Exit code the caller MUST use on audit-broker unavailable ------
-  // Matches PkgSubcommandsM1::EXIT_NOT_YET_IMPLEMENTED semantically
-  // (a third distinct code from EXIT_OP_FAIL and EXIT_USAGE) but is
-  // named for its actual meaning here: audit refused, no output emitted.
-  pub let AUDIT_EXIT_BROKER_FAIL : u64 = 3
+  // ENH-003 (#28): allocated its own code, 4, distinct from
+  // PkgSubcommandsM1::EXIT_NOT_YET_IMPLEMENTED (3). Before this a
+  // caller could not distinguish "recognised subcommand with no body
+  // yet" from "the audit broker was unavailable, so the operation
+  // refused and nothing was journalled" -- the second is
+  // security-relevant and deserves its own signal. 3 stays reserved
+  // for the not-yet-implemented stubs until the last one (verify,
+  // keys) lands a real body, per design/argv-surface.md §5.
+  pub let AUDIT_EXIT_BROKER_FAIL : u64 = 4
 
   // ---- Diagnostic string emitted on broker-unavailable ----------------
   pub let AUDIT_BROKER_MSG : [u8; 66] =

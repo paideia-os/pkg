@@ -156,10 +156,13 @@ across every body.
 | `0` | `EXIT_OK` | Success. |
 | `1` | `EXIT_OP_FAIL` | A pipeline step refused. The failing step names itself on stderr. |
 | `2` | `EXIT_USAGE` | argv parse error, no subcommand, unknown subcommand, or wrong positional arity. |
-| `3` | `EXIT_NOT_YET_IMPLEMENTED` / `AUDIT_EXIT_BROKER_FAIL` | Recognised subcommand with no body yet (`verify`, `keys`) — **or** the audit broker was unavailable, in which case no output was emitted at all. |
+| `3` | `EXIT_NOT_YET_IMPLEMENTED` | Recognised subcommand with no body yet (`verify`, `keys`). |
+| `4` | `AUDIT_EXIT_BROKER_FAIL` | The audit broker was unavailable, so the operation refused before any output was emitted and nothing was journalled. Security-relevant: distinct from `3` since ENH-003 (#28) so a caller cannot mistake "un-auditable" for "not yet implemented". |
 
 Code `3` is deliberately distinct from `2` so a caller can tell "pkg knows
-this word but has no body" from "pkg does not know this word".
+this word but has no body" from "pkg does not know this word". Code `4`
+is deliberately distinct from `3` for the same reason: a caller must be
+able to tell "the subcommand refused" from "nothing was journalled".
 
 ## Capabilities
 
@@ -259,7 +262,7 @@ Every subcommand journals to `/system/audit/user-events/` through
 
 ```
 audit_id = audit_begin_op(OP_NAME_PTR, OP_ARGS_PTR)
-if audit_id == 0: exit 3
+if audit_id == 0: exit 4   # AUDIT_EXIT_BROKER_FAIL (ENH-003 #28)
 ... subcommand output ...
 audit_record_op_output(audit_id, SCHEMA_HASH_PTR)   # optional
 audit_commit_op(audit_id, exit_code)

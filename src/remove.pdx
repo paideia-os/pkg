@@ -263,7 +263,7 @@ module Remove = structure {
   pub let pkg_remove_body : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "pkg.M3-003 pkg_remove_body, widened at ENH-008 (#33): audit-first via AuditWire::audit_begin_op BEFORE any output. Broker unavailable -> exit 3 without touching stdout/stderr. audit_id lands in _remove_audit_id .bss so epilogue commits without register-pressure hassle. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient / PkgElevate. Full pipeline (ENH-008 inserts the elevate stage ahead of lookup): pos_ptrs[1] check -> monotonic remove_id -> PkgElevate::pkg_elevate_request_pdxfs_write_pkgs (result in remove_parent_slot; 0 today, no output) -> lookup SEAM (no readdir at HEAD) -> txn_open(DELETE) -> serialise undo header + body -> trash-move SEAM -> txn_commit. Silent-remove-without-audit would violate I5 as well as I5's undo obligation; silent-remove-without-elevate would violate D4 (no ambient /pkgs write authority) the moment the lookup gate closes. Cleanup: txn_abort on any failure. Five callee-save pushes flip rsp%16 8->0. Labels prefixed pr_.",
+      justification: "pkg.M3-003 pkg_remove_body, widened at ENH-008 (#33): audit-first via AuditWire::audit_begin_op BEFORE any output. Broker unavailable -> exit 4 (ENH-003 #28) without touching stdout/stderr. audit_id lands in _remove_audit_id .bss so epilogue commits without register-pressure hassle. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient / PkgElevate. Full pipeline (ENH-008 inserts the elevate stage ahead of lookup): pos_ptrs[1] check -> monotonic remove_id -> PkgElevate::pkg_elevate_request_pdxfs_write_pkgs (result in remove_parent_slot; 0 today, no output) -> lookup SEAM (no readdir at HEAD) -> txn_open(DELETE) -> serialise undo header + body -> trash-move SEAM -> txn_commit. Silent-remove-without-audit would violate I5 as well as I5's undo obligation; silent-remove-without-elevate would violate D4 (no ambient /pkgs write authority) the moment the lookup gate closes. Cleanup: txn_abort on any failure. Five callee-save pushes flip rsp%16 8->0. Labels prefixed pr_.",
       block: {
         push rbx;
         push r12;
@@ -419,8 +419,8 @@ module Remove = structure {
         ret;
 
       pr_broker_fail:
-        // I5 refusal: no output, no audit_commit; exit 3.
-        mov rax, 3;                          // AUDIT_EXIT_BROKER_FAIL
+        // I5 refusal: no output, no audit_commit; exit 4 (ENH-003 #28).
+        mov rax, 4;                          // AUDIT_EXIT_BROKER_FAIL
         pop r15;
         pop r14;
         pop r13;

@@ -98,7 +98,7 @@ module SubcommandsM1Stubs = structure {
         ret;
 
       pv_broker_fail:
-        mov rax, 3;                             // AUDIT_EXIT_BROKER_FAIL
+        mov rax, 4;                             // AUDIT_EXIT_BROKER_FAIL (ENH-003 #28)
         pop r12;
         pop rbx;
         ret
@@ -137,7 +137,7 @@ module SubcommandsM1Stubs = structure {
         ret;
 
       pk_broker_fail:
-        mov rax, 3;
+        mov rax, 4;                             // AUDIT_EXIT_BROKER_FAIL (ENH-003 #28)
         pop r12;
         pop rbx;
         ret

@@ -109,19 +109,28 @@ fill in behind it without breaking existing call sites.
 
 ## 5. Exit codes
 
-| Code | Meaning                                                       | M1 sites                                                            |
-|------|---------------------------------------------------------------|---------------------------------------------------------------------|
-| `0`  | success                                                       | `pkg list` (real body)                                              |
-| `1`  | operation failed (reserved for M2+ bodies)                    | (none at M1)                                                        |
+| Code | Meaning                                                       | Sites                                                                |
+|------|---------------------------------------------------------------|-----------------------------------------------------------------------|
+| `0`  | success                                                       | `pkg list` (real body)                                                |
+| `1`  | operation failed                                              | `install` / `remove` pipeline step refusals                           |
 | `2`  | usage error (unknown subcommand, missing positional, parse)   | `Dispatch::dispatch_no_subcommand`, `Dispatch::dispatch_unknown`, `PkgMain` parse-fail |
-| `3`  | subcommand recognised, body not yet implemented               | `PkgSubcommandsM1::pkg_*_stub` (install / remove / verify / keys)   |
+| `3`  | subcommand recognised, body not yet implemented               | `PkgSubcommandsM1::pkg_*_stub` (`verify` / `keys`)                    |
+| `4`  | audit broker unavailable -- refused before any output, nothing journalled | `AuditWire::AUDIT_EXIT_BROKER_FAIL`, every subcommand body |
 
-`3` is deliberately reserved for this M1-only situation so a caller
-can distinguish "the pkg vocabulary knows this word but has no body
-yet" from "the pkg vocabulary does not know this word" (`2`). Once
-every stub is replaced by a real body (M2 for install / remove /
-verify; M5 for keys), exit code `3` becomes unused; M5 removes the
-reservation.
+`3` is deliberately reserved for the not-yet-implemented case so a
+caller can distinguish "the pkg vocabulary knows this word but has no
+body yet" from "the pkg vocabulary does not know this word" (`2`).
+Once `verify` and `keys` land real bodies, exit code `3` becomes
+unused and this reservation retires.
+
+`4` was split out of `3` at ENH-003 (#28, post-1.0.0): the M1 plan
+above said `3` "becomes unused" once every stub landed a real body,
+but M3-003 instead gave it a second meaning (audit-broker-unavailable)
+that has nothing to do with "not yet implemented" and is
+security-relevant in its own right -- a caller could not tell "the
+subcommand has no body" from "nothing was journalled" from the exit
+code alone. `4` carries that second meaning exclusively now, and `3`
+still retires on the plan above once `verify` / `keys` land.
 
 ## 6. Runnable example at M1
 
