@@ -76,6 +76,20 @@ module PkgElevate = structure {
   // STUB pending paideia-as v0.33-crypto-kdf.
   pub let PE_CAP_MASK_PDXFS_WRITE_PKGS : u64 = 0x01
 
+  // R90-XREPO.013.M3-008 (#39, Wave Z): bit 3 = KIND_PDXFS_FILE(write,
+  // /system/packages) for the M3-001 index writer once
+  // paideia-os R42-PREP-005 lands readdir on KIND_PDXFS_FILE and pkg
+  // starts maintaining the /system/packages/index.pdxlist file
+  // in-place. Non-adjacent to bit 0 so a subset comparison against
+  // the older /pkgs-only mask still holds. NO call site claims this
+  // bit at Wave-Z close; the constant is declared here so
+  // caps.decl's elevate-broker binding note (§ "elevate-broker
+  // binding") can name a symbol rather than a bare hex literal.
+  // Reserved bits 0x02 (KIND_NETWORK fetch) and 0x04
+  // (KIND_SIGNATURE verify) remain unclaimed pending the M4
+  // install-pipeline widening.
+  pub let PE_CAP_MASK_PDXFS_WRITE_SYSTEM_PACKAGES : u64 = 0x08
+
   // 60 seconds in nanoseconds. Matches design/user/model.md §5.1
   // example ("pkg install requests /pkgs write for 60s") and is inside
   // ElevateRequest's [ELV_DUR_MIN_NS=1s, ELV_DUR_MAX_NS=1h] range.

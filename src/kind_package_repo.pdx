@@ -37,6 +37,18 @@
 // of the sha3-256 (128 bits) are stored because a 64-bit hash under an
 // adversarial URL selection is thin.
 //
+// ---------------------------------------------------------------------
+// Advisory status (ENH-010, #35) -- mirror of the note in
+// src/kind_package_manifest.pdx. Row mint issues NO SYSCALL; the row
+// is process-local .bss and its state byte is written by the same code
+// that would be compromised if the pkg-side URL-prefix check were
+// wrong. The actual URL enforcement lives in the elevate broker (via
+// the fingerprint handoff above) -- THAT half is kernel-adjudicated;
+// the row on this side is bookkeeping. Do not conflate the two: a
+// PRP_STATE_ACTIVE row is not itself an authority. See
+// design/enh-010-advisory-status.md for the promote-or-document
+// disposition landed at Wave Z.
+//
 // State byte:
 //   PRP_STATE_ACTIVE   = 1   -- valid; fetch wrappers may use it
 //   PRP_STATE_EXHAUSTED = 2  -- rate cap fully consumed (M3+)

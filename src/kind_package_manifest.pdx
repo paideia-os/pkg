@@ -30,6 +30,36 @@
 // to a kernel-side derived kind -- is a code move, not a data-shape
 // redesign.
 //
+// ---------------------------------------------------------------------
+// Advisory status (ENH-010, #35) -- read this before treating any row
+// state as enforced.
+// ---------------------------------------------------------------------
+//
+// pmf_cap_mint_inner (below) issues NO SYSCALL. It claims a row in this
+// module's process-local .bss table and writes PMF_STATE_VERIFIED into
+// the state byte. The kernel is not called and does not adjudicate the
+// claim. Holding a row in PMF_STATE_VERIFIED is an in-process boolean
+// asserting "pkg checked the signatures" -- written by the same code
+// that would be compromised if the check were wrong. A bug anywhere
+// in pkg can set the bit, and nothing outside pkg can tell.
+//
+// This is deliberate at the R49 substrate: the two kinds are userspace-
+// defined per the upstream plan, and no kernel-side .pdx files exist
+// for them. The advisory posture is documented at Wave-Z close in
+// design/enh-010-advisory-status.md.
+//
+// Promotion to a kernel-adjudicated derived kind remains an option in
+// design/tooling/r49-r50-plan.md §5.1 (monorepo-owned). The row shape
+// above is deliberately chosen so promotion is a code move, not a data-
+// shape redesign.
+//
+// **Do not** treat PMF_STATE_VERIFIED as capability-enforced. Every
+// downstream consumer at HEAD refuses on the paideia-as v0.33-crypto-
+// kdf gate before this row is read, so no live install currently
+// depends on the row's assertion; that changes when the gate closes,
+// at which point the promote-or-document question in
+// design/enh-010-advisory-status.md becomes load-bearing.
+//
 // Row layout (48 bytes, six u64 words):
 //
 //   [+0]   header: in_use[63:56] | state[15:8] | flags[7:0]

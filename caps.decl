@@ -50,18 +50,33 @@ requires:
   # WRITE narrowing here.
   - KIND_PDXFS_FILE (read, /system/keys/)
 
-# --- elevate-broker binding (M3-004, widened at ENH-008 #33) -----------
+# --- elevate-broker binding (M3-004, widened at ENH-008 #33; scope
+# --- widened again at R90-XREPO.013.M3-008 #39 to name the two
+# --- distinct write targets pkg acquires on-demand) ---------------------
 # pkg_install and pkg_remove both invoke ElevateClient::
-# elevate_client_request_norealize on svc.elevate-broker to obtain a
-# KIND_PDXFS_FILE(write,/pkgs) cap for a 60-second window before
-# opening their respective txn (see src/pkg_elevate.pdx +
-# src/install.pdx pi_elevate stage + src/remove.pdx pr_elevate stage).
+# elevate_client_acquire (LE-001 #40) on svc.elevate-broker to obtain
+# a bounded-lifetime KIND_PDXFS_FILE(write, ...) cap for the /pkgs
+# subtree the install unpacks into and, at Wave-Z close (Wave Z #39),
+# for the /system/packages subtree the M3-001 index writer updates
+# once R42-PREP-005 lands the readdir/write axis. Both writes are
+# elevate-on-demand per R90-XREPO.011 (fail-closed on non-zero rc);
+# NEITHER is ambient at any milestone. See src/pkg_elevate.pdx
+# (PE_CAP_MASK_PDXFS_WRITE_PKGS = 0x01 for /pkgs;
+#  PE_CAP_MASK_PDXFS_WRITE_SYSTEM_PACKAGES = 0x08 for /system/packages,
+# added at #39 alongside this note). The bit assignments 0x02
+# (KIND_NETWORK fetch) and 0x04 (KIND_SIGNATURE verify) remain
+# reserved for the M4 install-pipeline widening; 0x08 is deliberately
+# non-adjacent so the older mask remains a subset comparison.
+#
 # The paideia-os elevate broker is not yet registered (§5.0
-# R48-PREP-005) so the request path resolves to svc_lookup miss; the
+# R48-PREP-005) so both request paths resolve to svc_lookup miss and
+# collapse to PE_PARENT_UNAVAILABLE = 0 (fail-closed); the
 # invoke-right below is still declared so libpdx-cap's
 # cap_manifest_verify accepts the pkg binary once the broker
 # registration lands. `pkg list` / `verify` / `keys` leave this cap
-# unused.
+# unused. `pkg upgrade` (R70.M1-006 #23, Wave-Z) shares
+# pkg_install's mask and does not currently claim
+# WRITE_SYSTEM_PACKAGES.
   - KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)   # 0x191 R48.M7
 
 # Declared output schemas — the semantic-pipe schema records this tool

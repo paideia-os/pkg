@@ -1,18 +1,22 @@
-// src/dispatch.pdx — pkg.M1-002, widened at ENH-004/#29 + ENH-005/#30
+// src/dispatch.pdx — pkg.M1-002, widened at ENH-004/#29 + ENH-005/#30,
+// then again at R70.M1-006/#23 (Wave Z) to route `upgrade`.
 // Dispatch module: subcommand-name byte-compare + route to a body.
 //
 // Scope
 // -----
-// The M1 argv surface accepts five subcommand names — install, remove,
-// list, verify, keys — with distinct first bytes (i/r/l/v/k). This
-// module byte-compares the caller-supplied name against those five and
-// jumps to the matching body:
+// The M1 argv surface accepted five subcommand names -- install, remove,
+// list, verify, keys -- with distinct first bytes (i/r/l/v/k). Wave Z
+// (#23) adds `upgrade` (u), taking the vocabulary to six. The first
+// byte remains a distinct-byte discriminator across all six; the
+// linear-cmp discipline is unchanged.
 //
 //   install → PkgInstall::pkg_install_body        (M2 real body)
 //   remove  → PkgRemove::pkg_remove_body          (M2 real body)
 //   list    → PkgList::pkg_list_body              (M1 real body)
 //   verify  → Verify::pkg_verify_body             (ENH-004 real body)
 //   keys    → Keys::pkg_keys_body                 (ENH-005 real body)
+//   upgrade → Upgrade::pkg_upgrade_body           (Wave-Z skeleton;
+//                                                  design/upgrade-flow.md)
 //
 // The verify + keys stubs in SubcommandsM1Stubs were retired at
 // ENH-004 (#29) + ENH-005 (#30) respectively; the file has been
@@ -64,15 +68,18 @@ module Dispatch = structure {
   pub let UNK_SUFFIX_LEN : u64         = 2
 
   // Short usage string emitted when no subcommand is supplied.
-  pub let USAGE_MSG : [u8; 51]         =
-    "usage: pkg <install|remove|list|verify|keys> [ARG]\n"
-  pub let USAGE_MSG_LEN : u64          = 51
+  // Wave Z (#23) added the sixth vocabulary entry `upgrade`; the
+  // usage line grows the pipe-list entry and the byte length recount
+  // (58 chars including the trailing newline; verified with wc).
+  pub let USAGE_MSG : [u8; 59]         =
+    "usage: pkg <install|remove|list|verify|keys|upgrade> [ARG]\n"
+  pub let USAGE_MSG_LEN : u64          = 59
 
   // -- Dispatch state ---------------------------------------------------
   // Records which subcommand fired; useful at M3 for the audit-first
   // journal record that has to name the subcommand before any output.
   // Values: 0 = none, 1 = install, 2 = remove, 3 = list, 4 = verify,
-  // 5 = keys, 0xFF = unknown.
+  // 5 = keys, 6 = upgrade (Wave Z #23), 0xFF = unknown.
   pub let mut chosen_subcommand : u64 = uninit @align(8)
 
   // ============================================================================
@@ -110,11 +117,11 @@ module Dispatch = structure {
   pub let dispatch_no_subcommand : () -> u64 !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "pkg.M1-002 dispatch_no_subcommand. Print USAGE_MSG on stderr; return EXIT_USAGE (2). rsp%16 was 8 on SysV entry; push rbx aligns to 0 for the nested syscall. rbx unused body-side but preserved for parity with the other dispatch entries.",
+      justification: "pkg.M1-002 dispatch_no_subcommand. Print USAGE_MSG on stderr; return EXIT_USAGE (2). rsp%16 was 8 on SysV entry; push rbx aligns to 0 for the nested syscall. rbx unused body-side but preserved for parity with the other dispatch entries. USAGE_MSG_LEN widened 51 -> 59 at Wave Z (#23) when `upgrade` joined the vocabulary list.",
       block: {
         push rbx;
         lea rdi, [rip + USAGE_MSG];
-        mov rsi, 51;                           // USAGE_MSG_LEN
+        mov rsi, 59;                           // USAGE_MSG_LEN
         call print_err;
         pop rbx;
         mov rax, 2;                            // EXIT_USAGE
@@ -182,6 +189,8 @@ module Dispatch = structure {
         je dispatch_try_verify;
         cmp rax, 0x6B;                          // 'k' (keys)
         je dispatch_try_keys;
+        cmp rax, 0x75;                          // 'u' (upgrade) -- Wave Z #23
+        je dispatch_try_upgrade;
         jmp dispatch_unknown;
 
       // ---- install: n s t a l l NUL ----
@@ -263,6 +272,24 @@ module Dispatch = structure {
         mov [r11], rax;
 
         call pkg_keys_body;
+        pop rbx;
+        ret;
+
+      // ---- upgrade: p g r a d e NUL ----  (Wave Z #23)
+      dispatch_try_upgrade:
+        xor rax, rax; mov_b rax, [rbx + 1]; cmp rax, 0x70; jne dispatch_unknown;  // 'p'
+        xor rax, rax; mov_b rax, [rbx + 2]; cmp rax, 0x67; jne dispatch_unknown;  // 'g'
+        xor rax, rax; mov_b rax, [rbx + 3]; cmp rax, 0x72; jne dispatch_unknown;  // 'r'
+        xor rax, rax; mov_b rax, [rbx + 4]; cmp rax, 0x61; jne dispatch_unknown;  // 'a'
+        xor rax, rax; mov_b rax, [rbx + 5]; cmp rax, 0x64; jne dispatch_unknown;  // 'd'
+        xor rax, rax; mov_b rax, [rbx + 6]; cmp rax, 0x65; jne dispatch_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rbx + 7]; cmp rax, 0;    jne dispatch_unknown;  // NUL
+
+        mov rax, 6;
+        lea r11, [rip + chosen_subcommand];
+        mov [r11], rax;
+
+        call pkg_upgrade_body;
         pop rbx;
         ret;
 

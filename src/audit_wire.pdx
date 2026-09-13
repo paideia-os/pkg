@@ -60,6 +60,13 @@ module AuditWire = structure {
   pub let OP_NAME_REMOVE  : [u8; 7] = "remove\0"
   pub let OP_NAME_VERIFY  : [u8; 7] = "verify\0"
   pub let OP_NAME_KEYS    : [u8; 5] = "keys\0"
+  // R70.M1-006 (#23, Wave Z): `pkg upgrade <name>`. Distinct string
+  // rather than reusing OP_NAME_INSTALL so an operator's audit-stream
+  // filter can separate "first install" from "upgrade in place" --
+  // the two are the same install pipeline downstream of the seams
+  // (see design/upgrade-flow.md §3) but the audit column is where
+  // that distinction is observable.
+  pub let OP_NAME_UPGRADE : [u8; 8] = "upgrade\0"
 
   // ---- Exit code the caller MUST use on audit-broker unavailable ------
   // ENH-003 (#28): allocated its own code, 4, distinct from

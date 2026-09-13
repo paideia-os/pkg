@@ -1,0 +1,233 @@
+// src/upgrade.pdx -- pkg.R70.M1-006 (#23, Wave Z)
+// PkgUpgrade module: `pkg upgrade <name>` body.
+//
+// Scope
+// -----
+// Wave Z lands the SKELETON: the audit-first entry, argv arity check,
+// progress diagnostic, and an honest UPGR_STUB refusal that names the
+// four upstream substrate gates blocking the mutating half. The
+// pipeline shape is documented in design/upgrade-flow.md §4; at Wave-Z
+// close there is nothing kernel-mutating to compile.
+//
+// The novel design choice (vs the R70 issue body's "mkdir-tempdir +
+// rename" prescription) is documented in design/upgrade-flow.md §2:
+// paideia-os' KIND_PDXFS_TXN in TXN_MODE_REPLACE covers the whole
+// upgrade in one journal record, so the "atomic swap" is a property
+// of a single kernel commit rather than a userspace rename dance.
+// The Wave-Z body does not need any of that plumbing yet -- it
+// refuses at UPGR_STUB before txn_open would be issued -- so no txn
+// wrapper widening is required at this milestone.
+//
+// paideia-as compliance -- same discipline as PkgVerify:
+//   - Module PkgUpgrade (PascalCase basename).
+//   - No `test` mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg,imm <= 0x7FFFFFFF (large-imm return codes staged
+//     via r11).
+//   - r11 scratch; byte reads via xor rax,rax + mov_b (paideia-as
+//     #1248 mitigation).
+//   - 3-push callee-save prologue (rbx=name_ptr, r12=seam rc,
+//     r13=exit code). Three pushes flip rsp%16 8 -> 0 -> 8 -> 0 --
+//     odd count aligns on its own without a pad, matching verify.pdx
+//     and dispatch.pdx.
+//   - Labels prefixed pu_ (distinct from pv_ / pi_ / pr_ so a stack
+//     trace scan disambiguates).
+
+module Upgrade = structure {
+
+  // ---- Diagnostic strings ---------------------------------------------
+  pub let UPGRADE_USAGE_MSG : [u8; 32] =
+    "usage: pkg upgrade <name>\n(pkg)\n"
+  pub let UPGRADE_USAGE_MSG_LEN : u64 = 32
+
+  pub let UPGRADE_STAGE_MSG_1 : [u8; 32] =
+    "pkg upgrade: upgrading package '"
+  pub let UPGRADE_STAGE_MSG_1_LEN : u64 = 32
+  pub let UPGRADE_STAGE_MSG_2 : [u8; 2] = "'\n"
+  pub let UPGRADE_STAGE_MSG_2_LEN : u64 = 2
+
+  // ENH-003 (#28) style refusal string. Four gates named so an
+  // operator has actionable text; keep on one line for the
+  // supervisor stderr[0] scrape convention that the test-matrix
+  // uses.
+  pub let UPGRADE_ERR_STUB : [u8; 107] =
+    "pkg upgrade: STUB -- txn_replace/crypto-kdf/elevate-broker/readdir gates open (see design/upgrade-flow.md)\n"
+  pub let UPGRADE_ERR_STUB_LEN : u64 = 107
+
+  // ---- Upgrade-progress state (populated across the pipeline) --------
+  pub let mut upgrade_name_ptr    : u64 = uninit @align(8)
+  pub let mut upgrade_step        : u64 = uninit @align(8)
+
+  // audit_id for the I5 begin/commit pair. Mirrors _verify_audit_id.
+  pub let mut _upgrade_audit_id : u64 = uninit @align(8)
+
+  pub let UPGRADE_STEP_NONE    : u64 = 0
+  pub let UPGRADE_STEP_ARITY   : u64 = 1
+  pub let UPGRADE_STEP_ANNOUNCE: u64 = 2
+  pub let UPGRADE_STEP_STUB    : u64 = 3   // where every Wave-Z run halts
+
+  // ==========================================================================
+  // upgrade_reset() -> ()
+  //
+  // Clear every upgrade_* .bss slot so a subsequent pkg_upgrade_body call
+  // starts from a known baseline. Leaf function; r11 scratch.
+  // ==========================================================================
+  pub let upgrade_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.R70.M1-006 (#23) upgrade_reset: zero every upgrade-progress slot so a subsequent pkg_upgrade_body call sees a known-empty state. Mirror of install_reset / verify_reset shape. Leaf function; r11 scratch used only for the lea. Labels: none.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + upgrade_name_ptr]; mov [r11], rax;
+        lea r11, [rip + upgrade_step];     mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pkg_upgrade_body() -> exit_code
+  //
+  // Signature: pkg_upgrade_body : () -> u64 !{mem, sysreg} @{cap, sched}
+  //
+  // Reads ParsedArgs::pos_count + ParsedArgs::pos_ptrs[1], then walks
+  // the audit-first entry + arity check + progress announce +
+  // honest STUB refusal. See design/upgrade-flow.md §4 for the shape
+  // that lands once the four upstream gates close.
+  //
+  // Register plan (3 callee-save pushes = 24 bytes; no pad):
+  //   rbx = pos_ptrs[1]  (name; survives every nested call)
+  //   r12 = seam rc scratch (unused at Wave Z; kept for the diff-flip)
+  //   r13 = final exit code accumulator (1 today; 0 once the pipeline
+  //         lands)
+  //   Entry rsp%16 == 8; three 8-byte pushes flip 8 -> 0 -> 8 -> 0
+  //   matching every nested call's alignment invariant.
+  //
+  // Exit codes:
+  //   0 -- upgrade succeeded (unreachable at Wave Z; every path exits 1
+  //        or 2 or 4)
+  //   1 -- op-fail (Wave-Z default: UPGR_STUB refusal)
+  //   2 -- usage error (wrong pos_count)
+  //   4 -- audit broker unavailable (AUDIT_EXIT_BROKER_FAIL, ENH-003 #28)
+  //
+  // Effects tail: !{mem, sysreg} @{cap, sched} matches AuditClient
+  // (audit_begin/commit) -- the txn/elevate widening lands with the
+  // real pipeline at gate-close.
+  // ==========================================================================
+  pub let pkg_upgrade_body : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.R70.M1-006 (#23, Wave Z) pkg_upgrade_body: Wave-Z skeleton for `pkg upgrade <name>`. Audit-first via AuditWire::audit_begin_op BEFORE any argv check or output; broker unavailable exits AUDIT_EXIT_BROKER_FAIL (4) without touching stdout/stderr. Pipeline stops at UPGRADE_STEP_STUB and prints UPGRADE_ERR_STUB naming the four upstream gates (see design/upgrade-flow.md §4); no txn_open, no elevate, no mint issued at Wave Z. audit_commit_op fires at every exit path (arity error, refusal, broker fail) so the audit ledger sees a matched INVOKE/EXIT pair per I5. 3 callee-save pushes (rbx=name_ptr, r12=seam rc scratch reserved for diff-flip, r13=exit) flip rsp%16 8 -> 0 -> 8 -> 0 -- odd push count aligns without a pad, matching verify.pdx's 3-push discipline. Effects tail !{mem, sysreg} @{cap, sched} matches AuditClient's tail; widens with the txn/elevate wrappers at gate-close. Labels prefixed pu_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        // 3 pushes: rsp%16 flips 8 -> 0 -> 8 -> 0. No pad needed.
+
+        // ---- Audit-first (I5) -----------------------------------------
+        lea rdi, [rip + OP_NAME_UPGRADE];
+        xor rsi, rsi;                         // op_args = 0 pre-arity check
+        call audit_begin_op;
+        cmp rax, 0;
+        je  pu_broker_fail;
+        lea r11, [rip + _upgrade_audit_id];
+        mov [r11], rax;
+
+        // Reset progress state after audit is armed.
+        call upgrade_reset;
+
+        // Wave-Z exit default: UPGR_STUB refusal after arity check.
+        mov r13, 1;                           // EXIT_OP_FAIL
+
+        // Step 1: pos_count == 2 check.
+        mov r11, 1;                           // UPGRADE_STEP_ARITY
+        lea rax, [rip + upgrade_step];
+        mov [rax], r11;
+
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne pu_usage_error;
+
+        // Step 1a: load pos_ptrs[1] -> rbx.
+        lea r11, [rip + pos_ptrs];
+        mov rbx, [r11 + 8];                   // pos_ptrs[1]
+        cmp rbx, 0;
+        je  pu_usage_error;
+
+        // Persist name pointer.
+        lea r11, [rip + upgrade_name_ptr];
+        mov [r11], rbx;
+
+        // Step 2: progress diagnostic on stdout ("pkg upgrade:
+        // upgrading package '<name>'").
+        mov r11, 2;                           // UPGRADE_STEP_ANNOUNCE
+        lea rax, [rip + upgrade_step];
+        mov [rax], r11;
+
+        lea rdi, [rip + UPGRADE_STAGE_MSG_1];
+        mov rsi, 32;                          // UPGRADE_STAGE_MSG_1_LEN
+        call print_str;
+
+        // Walk name to NUL for length.
+        mov rdx, rbx;
+      pu_name_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je  pu_name_walk_done;
+        add rdx, 1;
+        jmp pu_name_walk;
+      pu_name_walk_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call print_str;
+
+        lea rdi, [rip + UPGRADE_STAGE_MSG_2];
+        mov rsi, 2;                           // UPGRADE_STAGE_MSG_2_LEN
+        call print_str;
+
+        // Step 3: Wave-Z halt at UPGR_STUB. Emit the four-gate diag on
+        // stderr and fall through to the commit path.
+        mov r11, 3;                           // UPGRADE_STEP_STUB
+        lea rax, [rip + upgrade_step];
+        mov [rax], r11;
+
+        lea rdi, [rip + UPGRADE_ERR_STUB];
+        mov rsi, 107;                         // UPGRADE_ERR_STUB_LEN
+        call print_err;
+        jmp pu_commit;
+
+      // ---- Usage error branch ------------------------------------------
+      pu_usage_error:
+        lea rdi, [rip + UPGRADE_USAGE_MSG];
+        mov rsi, 32;                          // UPGRADE_USAGE_MSG_LEN
+        call print_err;
+        mov r13, 2;                           // EXIT_USAGE
+        jmp pu_commit;
+
+      // ---- Broker-fail branch ------------------------------------------
+      pu_broker_fail:
+        // audit_begin_op already emitted its own AUDIT_BROKER_MSG on
+        // stderr; return AUDIT_EXIT_BROKER_FAIL without emitting any
+        // upgrade-side output (I5).
+        pop r13;                              // restore for the ret discipline
+        pop r12;
+        pop rbx;
+        mov rax, 4;                           // AUDIT_EXIT_BROKER_FAIL
+        ret;
+
+      // ---- Commit + return path ----------------------------------------
+      pu_commit:
+        lea r11, [rip + _upgrade_audit_id];
+        mov rdi, [r11];                       // audit_id
+        mov rsi, r13;                         // exit_code
+        call audit_commit_op;
+
+        mov rax, r13;                         // return exit code
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

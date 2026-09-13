@@ -17,6 +17,24 @@ is the surviving design against the open "R70 — pkg MVP" milestone
 `design/enh-001-reconciliation.md` for the full disposition; nothing
 in this document changes as a result.
 
+**ENH-010 (#35, 2026-09-13, Wave Z):** `KIND_PACKAGE_MANIFEST = 0x193`
+and `KIND_PACKAGE_REPO = 0x192` remain userspace-defined derived kinds.
+Their mint helpers claim a row in a process-local `.bss` table and
+issue no syscall; `PMF_STATE_VERIFIED` and `PRP_STATE_ACTIVE` are
+in-process booleans, not kernel-adjudicated cap bits. Wave Z
+documented this posture rather than promoting the kinds; promotion
+remains an option in the paideia-os plan doc. Row shapes in
+`src/kind_package_manifest.pdx` and `src/kind_package_repo.pdx` are
+unchanged and are still promotion-ready. Decision record:
+`design/enh-010-advisory-status.md`.
+
+**R70.M1-008 (#25, 2026-09-13, Wave Z):** the R70 wave is closed
+against pkg. The R70 MVP was subsumed by the R49 M1-M5 chain via
+ENH-001; the closure retro is
+`design/round-retrospectives/r70-pkg-closure.md` (repo-local slice;
+the monorepo doc is `design/round-retrospectives/r70-closure.md` in
+paideia-os).
+
 ## 1. Milestone position
 
 M1 lands the frame: the argv surface, the subcommand routing, the

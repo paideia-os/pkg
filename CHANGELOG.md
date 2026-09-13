@@ -4,6 +4,61 @@ All notable changes to this repo are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with
 per-milestone attribution.
 
+## 1.2.0 — Wave Z (2026-09-13, unreleased)
+
+Round-closure drain of the R70 orphan chain plus the two open ENH
+substrate-context items and the XREPO caps.decl adoption. No R49-M1..M5
+code path shifts; every landing is skeleton, doc, or caps-boundary text.
+
+- `#23` R70.M1-006 — `pkg upgrade <name>`: Wave-Z skeleton body
+  (`src/upgrade.pdx`, new) + dispatch route (`src/dispatch.pdx` six-way
+  first-byte switch, `USAGE_MSG` widened 51→59 bytes) + design record
+  (`design/upgrade-flow.md`, new). The upgrade adopts a NOVEL shape
+  over the R70 issue body's POSIX mkdir-tempdir + rename prescription:
+  paideia-os' `KIND_PDXFS_TXN` in `TXN_MODE_REPLACE` covers the whole
+  swap in one journal record, so the "atomic swap" is a kernel commit
+  property rather than a userspace rename dance. Body refuses at
+  `UPGR_STUB` with a diagnostic naming the four upstream gates
+  (crypto-kdf, R48-PREP-005, R42-PREP-006, R42-PREP-007); audit-first
+  via `audit_begin_op(OP_NAME_UPGRADE)` before every argv check.
+  `src/audit_wire.pdx` grows `OP_NAME_UPGRADE`; `manifest.pdxproj`
+  sources gain `src/upgrade.pdx`.
+- `#25` R70.M1-008 — R70 round-closure retro (repo-local slice):
+  `design/round-retrospectives/r70-pkg-closure.md` (new) records that
+  R70 is closed as subsumed by the R49 M1-M5 chain (the ENH-001
+  reconciliation, extended with the per-issue satisfier table). The
+  `r70-closed` git tag is applied by main after the Wave-Z merge;
+  softarch does not tag.
+- `#34` ENH-009 — `tests/run-all.sh` (new) + `tests/README.md` +
+  `design/test-matrix.md`. Two-mode runner: `RUN_MODE=host` (the M4
+  status quo, the default) and `RUN_MODE=qemu` (delegates to
+  `paideia-os/tools/run-smoke.sh`, refuses fast at Wave-Z close
+  because the companion monorepo work is not yet wired). Reason for
+  the two modes is documented up front: every cell asserts a refusal
+  at a substrate seam, so host and kernel exec have been
+  byte-identical through M5-close; the QEMU mode makes the first
+  gate-close divergence visible instead of hiding it.
+- `#35` ENH-010 — KIND_PACKAGE_MANIFEST advisory-status decision:
+  `design/enh-010-advisory-status.md` (new) records the "documented
+  advisory" disposition; module preambles in
+  `src/kind_package_manifest.pdx` and `src/kind_package_repo.pdx`,
+  the `README.md` `### Kind ordinals: advisory` subsection, the
+  `doc/pkg.pdxdoc` `KIND ORDINALS` section, and the ENH-010 block in
+  `design/architecture.md` all name plainly that the mint helpers
+  issue no syscall and the state bytes are in-process booleans.
+  Promotion to a kernel-side derived kind remains a paideia-os
+  monorepo option per plan doc §5.1.
+- `#39` R90-XREPO.013.M3-008 — caps.decl adoption for the XREPO wave:
+  `caps.decl` elevate-broker binding section names both `/pkgs` and
+  `/system/packages` write authority explicitly (on-demand per
+  R90-XREPO.011), and `src/pkg_elevate.pdx` gains
+  `PE_CAP_MASK_PDXFS_WRITE_SYSTEM_PACKAGES = 0x08` (non-adjacent to
+  bit 0 so the older /pkgs-only mask remains a subset comparison).
+  Constant is declared but not claimed at Wave-Z close; call site
+  lands when the M3-001 index writer wires against readdir.
+
+Version bump 1.1.0 → 1.2.0 per Wave-Z close. `PDX_TOOL_NAME` unchanged.
+
 ## 1.1.0 — Wave S (unreleased)
 
 Enhancement-milestone drain over the open ENH backlog. Retires the

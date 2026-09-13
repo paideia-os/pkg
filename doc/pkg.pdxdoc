@@ -196,6 +196,21 @@ Unknown or missing subcommand:
   # -> pkg 1.0.0
   # -> exit 0
 
+KIND ORDINALS
+
+pkg introduces two userspace-defined derived kinds:
+- KIND_PACKAGE_MANIFEST = 0x193 (derived over KIND_PDXFS_FILE 0x195)
+- KIND_PACKAGE_REPO     = 0x192 (derived over KIND_NETWORK)
+
+Both are **advisory, not kernel-adjudicated** (ENH-010 #35). The mint
+helpers claim a row in a process-local .bss table inside pkg itself
+and issue no syscall. The row state bytes (PMF_STATE_VERIFIED,
+PRP_STATE_ACTIVE) are in-process booleans written by pkg's own code.
+The kernel does not check these rows; do not treat them as
+capability-enforced. Wave Z documented this posture; promotion to
+kernel-side derived kinds remains a paideia-os monorepo option and
+would change no on-disk row shape.
+
 SEE ALSO
 
 - see:doc                -- documentation reader (renders this file)
@@ -204,6 +219,8 @@ SEE ALSO
 - see:libpdx-semantic-pipe -- schema-typed pipe library
 - see:libpdx-audit       -- audit-first output library
 - see:libpdx-elevate     -- elevate protocol client library
+- design/enh-010-advisory-status.md -- Wave-Z decision record for
+  KIND_PACKAGE_MANIFEST / KIND_PACKAGE_REPO advisory status
 
 AUDIT
 

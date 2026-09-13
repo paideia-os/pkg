@@ -1,6 +1,18 @@
 # pkg — M4 test matrix
 
 **Wave:** R49  Milestone: M4  Issues: #13 (M4-001), #14 (M4-002), #15 (M4-003)
+
+**Wave-Z addendum (ENH-009 #34, 2026-09-13):** the suite has never
+executed under a paideia-os kernel — every cell here asserts a
+refusal at a substrate seam BEFORE the first interesting syscall
+issues, so host exec and kernel exec have been byte-identical
+transcripts through M5-close. `tests/run-all.sh` lands two modes at
+Wave-Z close: `RUN_MODE=host` (the M4 status quo; the default) and
+`RUN_MODE=qemu` (delegates to `paideia-os/tools/run-smoke.sh`, which
+is not wired at Wave-Z close and refuses fast). The kernel-run
+transition is guarded by the same three substrate gates listed in §6
+below; the first gate to close will expose the first true kernel-vs-
+host divergence.
 **Upstream:** [`design/tooling/r49-r50-plan.md`](https://github.com/paideia-os/paideia-os/blob/main/design/tooling/r49-r50-plan.md)
 §5.1 M4 line ("Bootstrap test (install pkg via pkg from a from-source
 build), sig-mismatch rejection tests (author sig bad, root sig bad,

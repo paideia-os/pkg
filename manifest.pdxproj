@@ -15,7 +15,7 @@
 # build-out/pkg.caps for the InitCap sidecar packaging step at M5.
 
 name        = pkg
-version     = 1.1.0
+version     = 1.2.0
 kind        = tool
 entry       = PkgMain::pkg_main
 output      = build-out/pkg
@@ -37,6 +37,7 @@ sources:
   - src/remove.pdx                # `pkg remove <name>` body + undo (M2-004 + M3-003 audit + ENH-007 dry-run)
   - src/verify.pdx                # `pkg verify <name>` real body (ENH-004 #29)
   - src/keys.pdx                  # `pkg keys [list]` real body (ENH-005 #30)
+  - src/upgrade.pdx               # `pkg upgrade <name>` skeleton (R70.M1-006 #23, Wave Z)
   - src/list.pdx                  # `pkg list` body (M1 + M3-001 schema + M3-003 audit)
   - src/dispatch.pdx              # subcommand recognizer + routing
   - src/main.pdx                  # pkg_main(argc, argv) entry point

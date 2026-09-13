@@ -68,6 +68,22 @@ never mutate `/pkgs`.
 unavailable the subcommand emits no output of its own and exits 4 — pkg
 refuses to act un-journalled rather than acting silently.
 
+### Kind ordinals: advisory, not kernel-adjudicated (ENH-010, #35)
+
+`KIND_PACKAGE_MANIFEST = 0x193` and `KIND_PACKAGE_REPO = 0x192` are
+**userspace-defined derived kinds**, per the upstream plan doc
+(`design/tooling/r49-r50-plan.md` §5.1). The mint helpers in
+`src/kind_package_manifest.pdx` and `src/kind_package_repo.pdx` issue
+**no syscall**: they claim a row in a process-local `.bss` table
+inside `pkg`. The `PMF_STATE_VERIFIED` and `PRP_STATE_ACTIVE` bits are
+in-process booleans, written by the same code that would be
+compromised if the check were wrong. **The kernel never adjudicates
+these rows.** Treat the naming (`KIND_*`, `pmf_cap_mint_inner`,
+`pmf_cap_revoke`) as *analogous to* a real cap operation, not as one.
+Wave Z formally documented this posture; promotion to a kernel-side
+derived kind remains an option on the R49/R50 roadmap and would
+change no on-disk shape. See `design/enh-010-advisory-status.md`.
+
 **Substrate state at 1.0.0.** Several verification and filesystem
 primitives that pkg calls are not yet present in the surrounding system,
 so the pipelines are wired end to end but halt at named seams. See
