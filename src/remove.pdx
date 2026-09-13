@@ -107,6 +107,17 @@ module Remove = structure {
     "pkg remove: undo record write failed -- refuse per I5\n(pkg)\n"
   pub let REMOVE_ERR_UNDO_LEN : u64 = 60
 
+  // ENH-007 (#32) --dry-run announce (two-piece around the name).
+  // Emitted on stdout in place of the stage + pipeline chain when
+  // --dry-run is set. Audit ledger still records an INVOKE/EXIT pair
+  // with exit_code = 0 -- a supervisor grep sees the pre-flight run.
+  pub let REMOVE_DRY_RUN_MSG_1 : [u8; 37] =
+    "pkg remove: --dry-run: would remove '"
+  pub let REMOVE_DRY_RUN_MSG_1_LEN : u64 = 37
+  pub let REMOVE_DRY_RUN_MSG_2 : [u8; 20] =
+    "' (no side effects)\n"
+  pub let REMOVE_DRY_RUN_MSG_2_LEN : u64 = 20
+
   // ---- Remove-progress state (populated across the pipeline) ----------
   pub let mut remove_name_ptr     : u64 = uninit @align(8)
   pub let mut remove_id           : u64 = uninit @align(8)
@@ -308,6 +319,40 @@ module Remove = structure {
         lea r11, [rip + remove_id];
         mov [r11], r12;
 
+        // ---- ENH-007 (#32) --dry-run short-circuit --------------------
+        // If --dry-run was set on argv, emit "would remove '<name>'"
+        // and short-circuit. r13 == 0 (from the scratch init above)
+        // means pr_epilogue's txn_abort gate skips cleanly.
+        call pkg_dry_run_is_set;
+        cmp rax, 0;
+        je  pr_pipeline;
+
+        lea rdi, [rip + REMOVE_DRY_RUN_MSG_1];
+        mov rsi, 37;                         // REMOVE_DRY_RUN_MSG_1_LEN
+        call print_str;
+
+        mov rdx, rbx;
+      pr_dr_name_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je  pr_dr_name_walk_done;
+        add rdx, 1;
+        jmp pr_dr_name_walk;
+      pr_dr_name_walk_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call print_str;
+
+        lea rdi, [rip + REMOVE_DRY_RUN_MSG_2];
+        mov rsi, 20;                         // REMOVE_DRY_RUN_MSG_2_LEN
+        call print_str;
+
+        xor r15, r15;                        // EXIT_OK
+        jmp pr_epilogue;
+
+      pr_pipeline:
         // Step 1b: emit progress diagnostic.
         lea rdi, [rip + REMOVE_STAGE_MSG_1];
         mov rsi, 27;                         // REMOVE_STAGE_MSG_1_LEN

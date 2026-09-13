@@ -4,6 +4,60 @@ All notable changes to this repo are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with
 per-milestone attribution.
 
+## 1.1.0 — Wave S (unreleased)
+
+Enhancement-milestone drain over the open ENH backlog. Retires the
+two remaining M1-era subcommand stubs (`verify`, `keys`), lands the
+operator's pre-flight (`--dry-run`), tracks libpdx-elevate's promotion
+of `elevate_client_acquire` as the sole supported entry point, and
+pins the contract for local-filesystem-path installs so the fetch-
+stage upgrade is a body-swap rather than a reshape.
+
+- `#29` ENH-004 — `pkg verify <name>`: real body replacing the M1
+  stub. Runs the ManifestCodec decode + dual-signature pipeline
+  (header → body-hash → sig-verify) read-only; SEAM refusals
+  (`MC_HASH_STUB`, `MC_VERIFY_STUB` pending paideia-as v0.33-crypto-kdf)
+  surface as `EXIT_OP_FAIL` with an actionable diagnostic. `src/verify.pdx`
+  (new), `src/dispatch.pdx` routing.
+- `#30` ENH-005 — `pkg keys [list]`: real body replacing the M5-tagged
+  stub. Positional check accepts bare `pkg keys` and `pkg keys list`;
+  header + placeholder emission gated on the SEAM enumerator that
+  wires against `/system/keys/` once paideia-os R42-PREP-008 lands.
+  `src/keys.pdx` (new), `src/dispatch.pdx` routing, `caps.decl` +1
+  read authority on `/system/keys/`.
+- `#32` ENH-007 — `--dry-run` for install + remove. New shared
+  `DryRun` module caches the flag from `ParsedArgs::flag_names[]`;
+  install / remove bodies short-circuit past every mutating step
+  (elevate, txn, mint, extract, commit) and emit
+  `pkg <cmd>: --dry-run: would <cmd> '<name>' (no side effects)`.
+  Audit ledger still records a matched INVOKE/EXIT pair with
+  exit_code = 0. `src/dry_run.pdx` (new), `src/main.pdx` wiring,
+  `src/install.pdx` + `src/remove.pdx` gates.
+- `#38` ENH-013 — path-resolution contract for local filesystem-path
+  repos. `design/local-filesystem-repos.md` pins how `pkg install
+  /path/to/foo.pkg` and `pkg install ./foo.pkg` resolve (absolute
+  vs relative, sidecar manifest derivation, elevate for local-read
+  outside the ambient grants). Contract only — no `.pdx` code with
+  this doc; fetch-stage upgrade lands once `sys_getcwd` (paideia-os
+  R86) is in place.
+- `#40` LE-001 — mechanical rename `elevate_client_request_norealize`
+  → `elevate_client_acquire` (the interim `_norealize` symbol
+  retired at libpdx-elevate 1.2). Same signature and semantics; pkg's
+  fail-closed disposition on non-zero rc is unchanged.
+  `src/pkg_elevate.pdx`, `src/install.pdx` comment,
+  `manifest.pdxproj` dep bump `^1.0` → `^1.2`, `deps.list`.
+- Retirement of `src/subcommands_m1_stubs.pdx` (dropped from
+  `manifest.pdxproj` sources; the last two stubs it hosted were
+  replaced by `#29` + `#30`).
+
+Wave S closed against every ENH issue in scope for this session
+(`#29`, `#30`, `#32`, `#38`, `#40`). ENH-006 (#31 `--help` /
+`--version`), ENH-008 (#33 elevate coverage), ENH-011 (#36 static
+`deps.list`) and ENH-012 (#37 `audit_record_op_output` call site)
+were already landed in the 1.0.0 line; the enhancement-plan.md
+issue-table is now fully drained modulo the paideia-os-owned
+substrate gates (`#26`, `#34`, `#35`).
+
 ## 1.0.0 — 2026-08-22
 
 The first signed release of pkg — the R49 wave package manager. Ships

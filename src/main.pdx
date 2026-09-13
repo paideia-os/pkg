@@ -51,6 +51,8 @@
 //   Dispatch::dispatch_reset     (this repo)
 //   Dispatch::dispatch_subcommand(this repo)
 //   Dispatch::dispatch_no_subcommand (this repo)
+//   DryRun::pkg_dry_run_reset    (this repo; ENH-007 #32)
+//   DryRun::pkg_dry_run_flag_check (this repo; ENH-007 #32)
 //   Print::print_str             (this repo; ENH-006 #31)
 //   Print::print_err             (this repo)
 
@@ -250,6 +252,15 @@ module Main = structure {
         je  pkg_main_help;
         cmp rax, 2;                            // MFC_VERSION
         je  pkg_main_version;
+
+        // ENH-007 (#32): --dry-run cache BEFORE dispatch. Unlike
+        // help/version, --dry-run does NOT short-circuit dispatch --
+        // install and remove still walk audit_begin + arity checks
+        // and then consult DryRun::pkg_dry_run_is_set at their
+        // mutating-step gates. Reset first so a re-invocation in the
+        // same process (M4 test harness) does not see a stale cache.
+        call pkg_dry_run_reset;
+        call pkg_dry_run_flag_check;
 
         // Step 4: reset dispatch state.
         call dispatch_reset;

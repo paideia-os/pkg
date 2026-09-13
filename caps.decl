@@ -41,6 +41,15 @@ requires:
   # 411ad0e).
   - KIND_PDXFS_FILE (read, /system/packages/)
 
+  # Read authority on /system/keys/ for `pkg keys list` (ENH-005 #30).
+  # Narrowed to READ. The trust root is public (it lists the ML-DSA-65
+  # fingerprints of the keys /pkgs signatures are verified against), so
+  # ambient read authority is safe; mutation is out of scope at any
+  # milestone (design/enhancement-plan.md §2.2 explicitly deferred
+  # `keys add` / `keys remove`) and is enforced by the absence of any
+  # WRITE narrowing here.
+  - KIND_PDXFS_FILE (read, /system/keys/)
+
 # --- elevate-broker binding (M3-004, widened at ENH-008 #33) -----------
 # pkg_install and pkg_remove both invoke ElevateClient::
 # elevate_client_request_norealize on svc.elevate-broker to obtain a

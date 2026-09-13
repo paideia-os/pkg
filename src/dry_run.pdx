@@ -1,0 +1,152 @@
+// src/dry_run.pdx -- pkg.ENH-007 (#32)
+// DryRun module: shared --dry-run flag scanner + state slot consumed by
+// PkgInstall::pkg_install_body and PkgRemove::pkg_remove_body.
+//
+// Scope
+// -----
+// --dry-run is the operator's only pre-flight against a privileged
+// install. It is *most* valuable while the pipeline is seam-blocked,
+// because it is the one mode that can meaningfully return 0 --
+// design/enhancement-plan.md §2.2 landing rationale. When set:
+//   * pkg install: skips elevate, txn_open, extract, commit; prints
+//                  "would install '<name>' (no side effects)\n" and
+//                  exits 0. The audit ledger still records an
+//                  INVOKE/EXIT pair with exit_code=0, so a supervisor
+//                  scanning /system/audit/user-events/ sees the
+//                  pre-flight run.
+//   * pkg remove:  skips lookup, txn_open(DELETE), trash-move,
+//                  commit; prints "would remove '<name>' (no side
+//                  effects)\n" and exits 0.
+//
+// pkg_meta_flag_check (main.pdx, ENH-006) owns the --help / --version
+// short-circuit; --dry-run is orthogonal (it does not short-circuit
+// dispatch -- install / remove still walk arity + audit_begin) so
+// keeping it in a separate module makes the two intents visually
+// distinct at every call site. The .bss flag lives here so both
+// install.pdx and remove.pdx can read it without duplicating the
+// libpdx-argv scan.
+//
+// The scan happens once, in pkg_main after parse_argv succeeds. Both
+// bodies read the cached _pkg_dry_run u64 rather than re-scanning
+// flag_names each time (dispatch calls one body per process at HEAD;
+// the caching still matters for the M4 test harness that invokes
+// bodies back-to-back in one binary).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module DryRun (PascalCase basename; file dry_run.pdx maps to
+//     DryRun per the module-basename-pascal rule).
+//   - No `test` mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg,imm <= 0x7FFFFFFF (byte literals only).
+//   - r11 scratch; byte reads via xor rax,rax + mov_b.
+//   - Leaf w.r.t. its own frame (no nested calls).
+//   - Labels prefixed pdr_.
+
+module DryRun = structure {
+
+  // ---- Cached scan result --------------------------------------------
+  // 0 = --dry-run NOT present; 1 = --dry-run present. Set by
+  // pkg_dry_run_flag_check; read by install / remove bodies.
+  pub let mut _pkg_dry_run : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // pkg_dry_run_reset() -> ()
+  //
+  // Zero the cached flag so a subsequent process (or an M4 test
+  // harness) starts from a known baseline. Not called on the hot path;
+  // pkg_main invokes it once at startup for parity with dispatch_reset.
+  // Leaf function; r11 scratch.
+  // ==========================================================================
+  pub let pkg_dry_run_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.ENH-007 (#32) pkg_dry_run_reset: zero _pkg_dry_run. Mirror of dispatch_reset / list_reset. Leaf function; r11 scratch. Labels: none.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + _pkg_dry_run];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pkg_dry_run_flag_check() -> 0 | 1
+  //
+  // Scan ParsedArgs::flag_names[0..flag_count) for a bare "dry-run"
+  // entry (libpdx-argv's long-flag parser stores the name ptr starting
+  // AFTER the leading "--", NUL-terminated in place). Cache the result
+  // in _pkg_dry_run and return the same value.
+  //
+  // Register plan (leaf; 1 push for rbx=loop index k):
+  //   rbx = loop index k
+  //   rcx = flag_count (loaded once)
+  //   rdx = candidate name ptr
+  //   rax = byte-compare scratch / return value
+  //   r11 = lea scratch
+  // ==========================================================================
+  pub let pkg_dry_run_flag_check : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.ENH-007 (#32) pkg_dry_run_flag_check: scan ParsedArgs::flag_names[0..flag_count) for a bare 'dry-run\\0' long flag (name ptr already skips '--' per libpdx-argv's parser). Same idiom as PkgMain::pkg_meta_flag_check: one push (rbx=k), byte-by-byte inline compare, first match wins. Cache the 1 or 0 in _pkg_dry_run so install/remove read it via pkg_dry_run_is_set without rescanning. Leaf; all immediates <= 0x7F (char codes). Labels prefixed pdr_fc_.",
+      block: {
+        push rbx;
+
+        lea r11, [rip + flag_count];
+        mov rcx, [r11];
+        xor rbx, rbx;
+
+      pdr_fc_loop:
+        cmp rbx, rcx;
+        jae pdr_fc_none;
+
+        lea r11, [rip + flag_names];
+        mov rdx, [r11 + rbx*8];
+
+        // Compare against "dry-run\0" (8 bytes including NUL).
+        xor rax, rax; mov_b rax, [rdx + 0]; cmp rax, 0x64; jne pdr_fc_advance;  // 'd'
+        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x72; jne pdr_fc_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x79; jne pdr_fc_advance;  // 'y'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x2D; jne pdr_fc_advance;  // '-'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x72; jne pdr_fc_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x75; jne pdr_fc_advance;  // 'u'
+        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x6E; jne pdr_fc_advance;  // 'n'
+        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0;    jne pdr_fc_advance;  // NUL
+
+        // Match. Cache 1 and return 1.
+        mov rax, 1;
+        lea r11, [rip + _pkg_dry_run];
+        mov [r11], rax;
+        pop rbx;
+        ret;
+
+      pdr_fc_advance:
+        add rbx, 1;
+        jmp pdr_fc_loop;
+
+      pdr_fc_none:
+        // No match. Cache 0 and return 0.
+        xor rax, rax;
+        lea r11, [rip + _pkg_dry_run];
+        mov [r11], rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pkg_dry_run_is_set() -> 0 | 1
+  //
+  // Accessor for install.pdx / remove.pdx. Reads the cached flag.
+  // Leaf function; no push/pop.
+  // ==========================================================================
+  pub let pkg_dry_run_is_set : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.ENH-007 (#32) pkg_dry_run_is_set: accessor for _pkg_dry_run. Read once, return in rax. Leaf; r11 scratch. Labels: none.",
+      block: {
+        lea r11, [rip + _pkg_dry_run];
+        mov rax, [r11];
+        ret
+      }
+    }
+}

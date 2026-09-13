@@ -1,0 +1,241 @@
+// src/keys.pdx -- pkg.ENH-005 (#30)
+// PkgKeys module: `pkg keys [list]` real body.
+//
+// Scope
+// -----
+// Replaces the M1-era SubcommandsM1Stubs::pkg_keys_stub with a real
+// text-only body that names the fingerprints of the trust-root keys
+// paideia-os ships in /system/keys/. The operator's only window onto
+// the trust root today: without it, a machine's operator has no way to
+// answer "which ML-DSA-65 public keys does this box trust for package
+// signatures?".
+//
+// caps.decl now grants KIND_PDXFS_FILE(read, /system/keys/) on top of
+// the existing (read, /system/packages/) grant so a boot-time cap-
+// manifest audit stays green when this body is invoked. Neither grant
+// is elevated -- both are baseline (D4 forbids ambient write authority
+// on /pkgs, not ambient read authority on public keys).
+//
+// Positional shape (mirrors design/argv-surface.md §3.1):
+//   pkg keys           -- equivalent to `pkg keys list` (dispatch match
+//                         accepts the bare `keys\0` argv).
+//   pkg keys list      -- explicit list request.
+//   pkg keys <other>   -- usage error (exit 2). Reserved for the M4+
+//                         `keys add` / `keys remove` vocabulary which
+//                         design/enhancement-plan.md §2.2 explicitly
+//                         placed out of scope; a graceful "unrecognised
+//                         subaction" now beats a silent list-anyway
+//                         later when those verbs land.
+//
+// Keys flow (SEAM-blocked at HEAD):
+//   1. audit_begin_op(OP_NAME_KEYS, 0) -- I5 audit-first.
+//   2. Positional check (pos_count == 1 OR (pos_count == 2 AND
+//      pos_ptrs[1] byte-matches "list\0")).
+//   3. Print header "trusted signing keys:\n".
+//   4. Enumerate /system/keys/ via keys_enumerate() -- STUB at HEAD;
+//      the KIND_PDXFS_FILE.readnext op (paideia-os R42-PREP-008)
+//      exists but pkg has no InitCap-seeded KIND_MEMORY cap for
+//      /system/keys/ yet, so the enumerator returns 0. Same shape as
+//      PkgList::pkg_list_enumerate.
+//   5. If count == 0, print the placeholder "  (none -- ...)\n" so a
+//      supervisor knows the enumerator refused rather than a genuinely
+//      empty trust root (a machine with an empty trust root should not
+//      boot at all).
+//   6. If count > 0, emit one line per key (M4+ walks the .bss name
+//      table populated by keys_enumerate; deliberately dead code at
+//      HEAD so the M4 patch adds the loop body without moving any
+//      existing instruction).
+//   7. audit_commit_op(audit_id, exit) + return exit.
+//
+// Exit codes:
+//   0 -- keys enumerated (even if zero rows returned)
+//   2 -- usage error (unrecognised subaction)
+//   4 -- audit broker unavailable (AUDIT_EXIT_BROKER_FAIL, ENH-003 #28)
+//
+// paideia-as compliance -- same discipline as PkgList / PkgVerify:
+//   - Module PkgKeys (PascalCase basename; `Keys` alone would shadow
+//     the KIND_KEY-adjacent vocabulary in a future audit reader, so
+//     the file uses `keys.pdx` and this module declaration remains
+//     `Keys` per the file-basename-pascal rule).
+//   - No `test` mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg,imm <= 0x7FFFFFFF (all char codes here <= 0x7F;
+//     no large-imm return codes on the text-only path).
+//   - r11 scratch; byte reads via xor rax,rax + mov_b (paideia-as
+//     #1248 mitigation).
+//   - 2-push callee-save prologue (rbx unused body-side but preserves
+//     rsp%16 == 0 for the nested calls; r12 = audit_id across the
+//     body). Labels prefixed pk_.
+
+module Keys = structure {
+
+  // ---- Diagnostic strings ---------------------------------------------
+  pub let KEYS_HEADER : [u8; 22] = "trusted signing keys:\n"
+  pub let KEYS_HEADER_LEN : u64  = 22
+
+  pub let KEYS_PLACEHOLDER : [u8; 71] =
+    "  (none -- /system/keys/ readdir unavailable; paideia-os R42-PREP-008)\n"
+  pub let KEYS_PLACEHOLDER_LEN : u64 = 71
+
+  pub let KEYS_USAGE_MSG : [u8; 29] =
+    "usage: pkg keys [list]\n(pkg)\n"
+  pub let KEYS_USAGE_MSG_LEN : u64 = 29
+
+  // ---- Enumeration state ----------------------------------------------
+  // Populated by keys_enumerate. At HEAD keys_enumerated_count stays 0
+  // because the enumerator is a STUB (see the M2 note above). Mirror of
+  // PkgList::enumerated_count.
+  pub let mut keys_enumerated_count : u64 = uninit @align(8)
+
+  // audit_id from AuditClient::audit_begin. Mirrors _install_audit_id
+  // and _remove_audit_id.
+  pub let mut _keys_audit_id : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // keys_reset() -> ()
+  //
+  // Clear keys_enumerated_count so a subsequent pkg_keys_body call
+  // starts from a known-zero baseline. Leaf function.
+  // ==========================================================================
+  pub let keys_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.ENH-005 (#30) keys_reset: zero keys_enumerated_count. Mirror of list_reset. Leaf; r11 scratch.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + keys_enumerated_count];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // keys_enumerate() -> count
+  //
+  // STUB at HEAD: returns 0 and writes 0 into keys_enumerated_count.
+  // paideia-os KIND_PDXFS_FILE.readnext (R42-PREP-008) is the substrate
+  // this walks once /system/keys/ is a seeded subtree. Same signature
+  // shape as pkg_list_enumerate so the M4 diff-flip is a body-swap
+  // rather than a signature change at every call site.
+  // ==========================================================================
+  pub let keys_enumerate : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.ENH-005 (#30) keys_enumerate STUB: always returns 0 and writes 0 into keys_enumerated_count. Body-swap when KIND_PDXFS_FILE.readnext + /system/keys/ InitCap seed land. Signature stable (u64 count). Labels: none.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + keys_enumerated_count];
+        mov [r11], rax;
+        xor rax, rax;                          // count = 0
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pkg_keys_body() -> exit_code
+  //
+  // Signature: pkg_keys_body : () -> u64 !{mem, sysreg} @{cap, sched}
+  //
+  // Register plan (2 callee-save pushes):
+  //   rbx = unused body-side but preserves rsp%16 == 0 for nested calls
+  //   r12 = audit_id across the body
+  //
+  // Effects tail: !{mem, sysreg} @{cap, sched} matches AuditClient's
+  // tail -- the same shape pkg_list_body uses (this body's I/O is only
+  // print_str and the audit begin/commit pair; the SEAM enumerator is
+  // !{mem} @{} so it does not widen the tail on its own).
+  // ==========================================================================
+  pub let pkg_keys_body : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.ENH-005 (#30) pkg_keys_body: real body replacing SubcommandsM1Stubs::pkg_keys_stub. Audit-first via AuditWire::audit_begin_op BEFORE any output; broker unavailable exits AUDIT_EXIT_BROKER_FAIL (4). Positional check accepts pos_count==1 (bare `pkg keys`) OR pos_count==2 with pos_ptrs[1] byte-matching 'list\\0'; any other second positional is a usage error (reserved for the M4+ keys add/remove verbs). Body: header -> keys_enumerate SEAM -> per-count branch (placeholder OR per-entry emit; M4 walks a .bss name table). audit_commit_op fires at every exit path per I5. 2 callee-save pushes (rbx unused body-side, r12=audit_id) keep rsp%16 == 0 for every nested call (SysV entry rsp%16 == 8 -> +2 pushes -> 0; matches PkgList::pkg_list_body prologue). Labels prefixed pk_.",
+      block: {
+        push rbx;
+        push r12;
+
+        // ---- Audit-first (I5) -----------------------------------------
+        lea rdi, [rip + OP_NAME_KEYS];
+        xor rsi, rsi;
+        call audit_begin_op;
+        cmp rax, 0;
+        je  pk_broker_fail;
+        mov r12, rax;                          // audit_id
+        lea r11, [rip + _keys_audit_id];
+        mov [r11], r12;
+
+        call keys_reset;
+
+        // Positional check: pos_count == 1 OR (pos_count == 2 AND
+        // pos_ptrs[1] == "list").
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        je  pk_body;
+        cmp rax, 2;
+        jne pk_usage_error;
+
+        // pos_count == 2: verify pos_ptrs[1] == "list\0".
+        lea r11, [rip + pos_ptrs];
+        mov rdx, [r11 + 8];                    // pos_ptrs[1]
+        cmp rdx, 0;
+        je  pk_usage_error;
+
+        xor rax, rax; mov_b rax, [rdx + 0]; cmp rax, 0x6C; jne pk_usage_error;  // 'l'
+        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x69; jne pk_usage_error;  // 'i'
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x73; jne pk_usage_error;  // 's'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x74; jne pk_usage_error;  // 't'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0;    jne pk_usage_error;  // NUL
+
+      pk_body:
+        // Print header.
+        lea rdi, [rip + KEYS_HEADER];
+        mov rsi, 22;                           // KEYS_HEADER_LEN
+        call print_str;
+
+        // Enumerate.
+        call keys_enumerate;
+        cmp rax, 0;
+        jne pk_names_loop_head;
+
+        // Zero-count placeholder.
+        lea rdi, [rip + KEYS_PLACEHOLDER];
+        mov rsi, 71;                           // KEYS_PLACEHOLDER_LEN
+        call print_str;
+        jmp pk_done_ok;
+
+      pk_names_loop_head:
+        // M4+ per-entry emit. Deliberately empty at HEAD -- a fall-
+        // through to pk_done_ok -- so the M4 patch adds the loop body
+        // without moving any existing instruction. Same shape as
+        // PkgList::pkg_list_body_names_loop_head.
+        jmp pk_done_ok;
+
+      pk_done_ok:
+        mov rdi, r12;                          // audit_id
+        xor rsi, rsi;                          // exit_code = 0
+        call audit_commit_op;
+        xor rax, rax;                          // EXIT_OK
+        pop r12;
+        pop rbx;
+        ret;
+
+      pk_usage_error:
+        lea rdi, [rip + KEYS_USAGE_MSG];
+        mov rsi, 29;                           // KEYS_USAGE_MSG_LEN
+        call print_err;
+        mov rdi, r12;                          // audit_id
+        mov rsi, 2;                            // exit_code = 2
+        call audit_commit_op;
+        mov rax, 2;                            // EXIT_USAGE
+        pop r12;
+        pop rbx;
+        ret;
+
+      pk_broker_fail:
+        // I5 refusal: no stdout, no audit_commit; exit 4.
+        mov rax, 4;                            // AUDIT_EXIT_BROKER_FAIL
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

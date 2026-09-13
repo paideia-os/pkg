@@ -1,25 +1,22 @@
 // src/pkg_elevate.pdx -- pkg.M3-004 (#12), renamed call site at
-// pkg.ENH-008 (#33) for libpdx-elevate.ENH-005 (#12 upstream)
+// pkg.ENH-008 (#33), renamed again at pkg.LE-001 (#40) to track
+// libpdx-elevate's post-v1.1 real-broker API landing.
 // PkgElevate module: pkg-side wrapper around libpdx-elevate's
-// ElevateClient::elevate_client_request_norealize. Requests
+// ElevateClient::elevate_client_acquire. Requests
 // KIND_PDXFS_FILE(write, /pkgs) for a 60-second window and returns a
 // parent_slot the caller threads into TxnClient::txn_open.
 //
-// ENH-008 note (2026-08-25): libpdx-elevate v1.1.0 renamed
-// `elevate_client_request` to `elevate_client_request_norealize` and
-// retired the old name entirely (source-breaking; see that repo's
-// elevate_client.pdx "WHY THE RENAME"). The audit that drove the
-// rename found `rm` treated the M1 stub sentinel as PROCEED
-// (fail-open) while `pkg` treated it as UNAVAILABLE (fail-closed,
-// see pkg_elevate_request_pdxfs_write_pkgs below: any non-zero rc,
-// stub included, collapses to PE_PARENT_UNAVAILABLE = 0). pkg's own
-// disposition was already correct; only the symbol name needed to
-// follow upstream. A future migration to `elevate_client_request_ex`
-// / `elevate_client_acquire` for a real broker round-trip is tracked
-// separately -- it needs a caller-owned reply endpoint this wrapper
-// does not yet allocate, and the broker itself is still unregistered
-// (paideia-os R48-PREP-005), so real dispatch has no observable
-// effect yet either way.
+// LE-001 note (#40, this repo): libpdx-elevate retired the interim
+// `elevate_client_request_norealize` symbol (which ENH-008 #33 had
+// itself renamed from the original `elevate_client_request`) and
+// promoted `elevate_client_acquire` as the single supported entry
+// point for a bounded-lifetime cap acquire. The signature and
+// semantics carry over unchanged from the interim `_norealize`
+// name -- pkg's own disposition logic below is fail-closed (any
+// non-zero rc, stub included, collapses to PE_PARENT_UNAVAILABLE = 0)
+// and was already correct; only the symbol name moves. The broker
+// itself remains unregistered (paideia-os R48-PREP-005), so real
+// dispatch has no observable effect yet either way.
 //
 // Scope
 // -----
@@ -31,17 +28,17 @@
 // lifetime write cap via the elevate broker and drops it at txn close.
 //
 // At M3, the paideia-os elevate broker is not yet registered (§5.0
-// R48-PREP-005), so ElevateClient::elevate_client_request_norealize
+// R48-PREP-005), so ElevateClient::elevate_client_acquire
 // returns ELVC_ERR_LOOKUP_FAIL (svc.elevate-broker miss) OR
 // ELVC_NOT_DISPATCHED (broker resolved but this entry point never
 // dispatches by design -- see libpdx-elevate's elevate_client.pdx).
 // Both paths surface as parent_slot = 0 from this wrapper; the
 // caller's TxnClient::txn_open then refuses with PXT_MINT_BAD_PARENT
 // and pkg_install_body branches to pi_err_parent with the operator-
-// facing diagnostic. A future migration to elevate_client_request_ex
-// / elevate_client_acquire replaces this call for a real broker
-// round-trip; this wrapper decodes the reply and returns the granted
-// parent_slot as-is once that lands.
+// facing diagnostic. elevate_client_acquire is the sole
+// libpdx-elevate v1.2+ entry point; this wrapper decodes the reply
+// and returns the granted parent_slot as-is once the broker starts
+// dispatching (unchanged shape here).
 //
 // paideia-as compliance
 // ---------------------
@@ -111,7 +108,7 @@ module PkgElevate = structure {
   //
   // Zero the two bookkeeping slots so a subsequent call sees a known
   // baseline. Scratch buffers are NOT zeroed here -- ElevateClient::
-  // elevate_client_request_norealize overwrites them fully on entry
+  // elevate_client_acquire overwrites them fully on entry
   // (or refuses before touching them, per its ELV_ERR_BAD_BUF
   // contract), so a leftover from a prior call is safe.
   //
@@ -148,7 +145,7 @@ module PkgElevate = structure {
   //                                   only needs one branch: "did I
   //                                   get a slot or not?"
   //
-  // ElevateClient::elevate_client_request_norealize return codes:
+  // ElevateClient::elevate_client_acquire return codes:
   //   0        ELVC_OK               -- reply landed in _pe_rep_buf.
   //                                     M4: decode the granted cap slot
   //                                     from body word 0.
@@ -172,12 +169,12 @@ module PkgElevate = structure {
   //
   // Register plan (leaf w.r.t. its own frame; nested-call frame):
   //   Two callee-save pushes (r12, r13) + one sub rsp,8 pad = 24 bytes.
-  //   r12 = ELVC_* return from elevate_client_request_norealize
+  //   r12 = ELVC_* return from elevate_client_acquire
   //         (survives across the reply-decode call at M4+; unused at
   //         M3).
   //   r13 = decoded parent_slot (0 unless M4 ELVC_OK path runs).
   //   Entry rsp%16 == 8; two pushes -> rsp%16 == 8; sub rsp,8 pad ->
-  //   rsp%16 == 0 for the nested elevate_client_request_norealize
+  //   rsp%16 == 0 for the nested elevate_client_acquire
   //   call.
   //
   // Effects tail: !{mem} @{} -- matches ElevateClient::elevate_client_
@@ -191,7 +188,7 @@ module PkgElevate = structure {
   pub let pkg_elevate_request_pdxfs_write_pkgs : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "pkg.ENH-008 (#33) pkg_elevate_request_pdxfs_write_pkgs: wrap ElevateClient::elevate_client_request_norealize(caps=0x01, dur=60s, req_buf=&_pe_req_buf, reply_buf=&_pe_rep_buf) -- renamed upstream at libpdx-elevate.ENH-005 (#12) from elevate_client_request; same signature and semantics, pkg's own disposition logic below was already fail-closed and is unchanged. Duration 60_000_000_000 exceeds imm32 so it is staged via r10 (mov r10, 60000000000; mov rsi, r10). Two callee-save pushes (r12=raw ELVC_ rc, r13=decoded parent_slot) + one sub rsp,8 pad = 24 bytes; entry rsp%16 == 8 -> post-prologue == 0 for the nested elevate_client_request_norealize call. Result translation: ELVC_OK (0) -> M4 will decode reply frame word 0 as the granted cap slot; at M3 we do not have a live reply so the decode is short-circuited to 0 (the M4 caller replaces the xor r13,r13 with a real load). Any non-OK rc (ELVC_NOT_DISPATCHED included) -> return 0 (PE_PARENT_UNAVAILABLE). Bookkeeping: _pe_last_rc receives the raw ELVC_ rc; _pe_parent_slot receives the returned slot (0 today). Effects tail !{mem} @{} matches libpdx-elevate's own signature for this entry point; a future migration to elevate_client_request_ex / elevate_client_acquire widens this to !{mem, sysreg} @{cap, sched} or !{mem} @{boot, cap} respectively. Labels prefixed pe_.",
+      justification: "pkg.LE-001 (#40) pkg_elevate_request_pdxfs_write_pkgs: wrap ElevateClient::elevate_client_acquire(caps=0x01, dur=60s, req_buf=&_pe_req_buf, reply_buf=&_pe_rep_buf) -- mechanical rename from the retired interim `elevate_client_request_norealize` symbol which ENH-008 (#33) had itself renamed from the original `elevate_client_request`. Same signature and semantics carry over; pkg's own disposition logic below is fail-closed (any non-zero rc, stub included, collapses to PE_PARENT_UNAVAILABLE = 0) and was already correct. Duration 60_000_000_000 exceeds imm32 so it is staged via r10 (mov r10, 60000000000; mov rsi, r10). Two callee-save pushes (r12=raw ELVC_ rc, r13=decoded parent_slot) + one sub rsp,8 pad = 24 bytes; entry rsp%16 == 8 -> post-prologue == 0 for the nested elevate_client_acquire call. Result translation: ELVC_OK (0) -> M4 will decode reply frame word 0 as the granted cap slot; at M3 we do not have a live reply so the decode is short-circuited to 0 (the M4 caller replaces the xor r13,r13 with a real load). Any non-OK rc (ELVC_NOT_DISPATCHED included) -> return 0 (PE_PARENT_UNAVAILABLE). Bookkeeping: _pe_last_rc receives the raw ELVC_ rc; _pe_parent_slot receives the returned slot (0 today). Effects tail !{mem} @{} matches libpdx-elevate's own signature for this entry point; widens to !{mem, sysreg} @{cap, sched} at the same commit the library's real send/recv path lands. Labels prefixed pe_.",
       block: {
         push r12;
         push r13;
@@ -202,7 +199,7 @@ module PkgElevate = structure {
         mov r10, 60000000000;                // PE_DURATION_60S_NS
         mov rsi, r10;
 
-        // Marshal ElevateClient::elevate_client_request_norealize args.
+        // Marshal ElevateClient::elevate_client_acquire args.
         //   rdi = caps  = 0x01 (PE_CAP_MASK_PDXFS_WRITE_PKGS)
         //   rsi = dur   = staged above from r10
         //   rdx = req_buf
@@ -210,7 +207,7 @@ module PkgElevate = structure {
         mov rdi, 1;                          // PE_CAP_MASK_PDXFS_WRITE_PKGS
         lea rdx, [rip + _pe_req_buf];
         lea rcx, [rip + _pe_rep_buf];
-        call elevate_client_request_norealize;
+        call elevate_client_acquire;
         mov r12, rax;                        // r12 = raw ELVC_ rc
 
         // Persist raw rc for the supervisor bookkeeping.

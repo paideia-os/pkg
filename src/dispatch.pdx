@@ -1,4 +1,4 @@
-// src/dispatch.pdx — pkg.M1-002
+// src/dispatch.pdx — pkg.M1-002, widened at ENH-004/#29 + ENH-005/#30
 // Dispatch module: subcommand-name byte-compare + route to a body.
 //
 // Scope
@@ -8,11 +8,15 @@
 // module byte-compares the caller-supplied name against those five and
 // jumps to the matching body:
 //
-//   install → PkgSubcommandsM1::pkg_install_stub  (M1 stub; M2 body)
-//   remove  → PkgSubcommandsM1::pkg_remove_stub   (M1 stub; M2 body)
+//   install → PkgInstall::pkg_install_body        (M2 real body)
+//   remove  → PkgRemove::pkg_remove_body          (M2 real body)
 //   list    → PkgList::pkg_list_body              (M1 real body)
-//   verify  → PkgSubcommandsM1::pkg_verify_stub   (M1 stub; M2 body)
-//   keys    → PkgSubcommandsM1::pkg_keys_stub     (M1 stub; M5 body)
+//   verify  → Verify::pkg_verify_body             (ENH-004 real body)
+//   keys    → Keys::pkg_keys_body                 (ENH-005 real body)
+//
+// The verify + keys stubs in SubcommandsM1Stubs were retired at
+// ENH-004 (#29) + ENH-005 (#30) respectively; the file has been
+// dropped from manifest.pdxproj sources.
 //
 // Everything else prints a "unknown subcommand" diagnostic on stderr
 // and returns exit code 2 (usage error).
@@ -243,7 +247,7 @@ module Dispatch = structure {
         lea r11, [rip + chosen_subcommand];
         mov [r11], rax;
 
-        call pkg_verify_stub;
+        call pkg_verify_body;
         pop rbx;
         ret;
 
@@ -258,7 +262,7 @@ module Dispatch = structure {
         lea r11, [rip + chosen_subcommand];
         mov [r11], rax;
 
-        call pkg_keys_stub;
+        call pkg_keys_body;
         pop rbx;
         ret;
 

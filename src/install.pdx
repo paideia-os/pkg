@@ -104,6 +104,17 @@ module Install = structure {
     "pkg install: elevate did not grant KIND_MEMORY parent for /pkgs (M3-004)\n"
   pub let INSTALL_ERR_PARENT_LEN : u64 = 73
 
+  // ENH-007 (#32) --dry-run announce (two-piece around the name).
+  // Emitted on stdout in place of the STAGE + pipeline chain when
+  // --dry-run is set. Audit ledger still records an INVOKE/EXIT pair
+  // with exit_code = 0 -- a supervisor grep sees the pre-flight run.
+  pub let INSTALL_DRY_RUN_MSG_1 : [u8; 39] =
+    "pkg install: --dry-run: would install '"
+  pub let INSTALL_DRY_RUN_MSG_1_LEN : u64 = 39
+  pub let INSTALL_DRY_RUN_MSG_2 : [u8; 20] =
+    "' (no side effects)\n"
+  pub let INSTALL_DRY_RUN_MSG_2_LEN : u64 = 20
+
   // ---- Install-progress state (populated across the pipeline) ----------
   // .bss singletons -- match the ParsedManifest / ParsedArgs shape so
   // the M4 test harness can read the final state after a call returns.
@@ -295,6 +306,44 @@ module Install = structure {
         lea r11, [rip + install_name_ptr];
         mov [r11], rbx;
 
+        // ---- ENH-007 (#32) --dry-run short-circuit --------------------
+        // If --dry-run was set on argv, print the "would install <n>"
+        // pre-flight message and exit 0 without touching elevate, txn
+        // or mint. Audit ledger still records an INVOKE/EXIT pair via
+        // the existing pi_epilogue (r13 == 0xFF, r14 == 0xFFFF from the
+        // scratch init above so pi_ep_check_pmf and the txn_abort gate
+        // both short-circuit cleanly).
+        call pkg_dry_run_is_set;
+        cmp rax, 0;
+        je  pi_pipeline;
+
+        // Emit "pkg install: --dry-run: would install '<name>' (no side effects)\n".
+        lea rdi, [rip + INSTALL_DRY_RUN_MSG_1];
+        mov rsi, 39;                         // INSTALL_DRY_RUN_MSG_1_LEN
+        call print_str;
+
+        mov rdx, rbx;
+      pi_dr_name_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je  pi_dr_name_walk_done;
+        add rdx, 1;
+        jmp pi_dr_name_walk;
+      pi_dr_name_walk_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call print_str;
+
+        lea rdi, [rip + INSTALL_DRY_RUN_MSG_2];
+        mov rsi, 20;                         // INSTALL_DRY_RUN_MSG_2_LEN
+        call print_str;
+
+        xor r15, r15;                        // EXIT_OK
+        jmp pi_epilogue;
+
+      pi_pipeline:
         // Step 2: emit progress diagnostic on stdout so a caller sees
         // "we started" even if the pipeline stops at a seam.
         lea rdi, [rip + INSTALL_STAGE_MSG_1];
@@ -480,12 +529,12 @@ module Install = structure {
         // BAD_PARENT (0xFFFFEC2D) is the one we expect while
         // pkg_elevate_request_pdxfs_write_pkgs still returns
         // PE_PARENT_UNAVAILABLE (0) -- ElevateClient::
-        // elevate_client_request_norealize never dispatches, and the
-        // broker itself remains unregistered (paideia-os
-        // R48-PREP-005) -- diagnostic-branch on it so a maintainer
-        // knows the elevate reply is the missing piece rather than a
-        // txn-model bug. All other high-band returns hit the generic
-        // TXN error path.
+        // elevate_client_acquire (LE-001 #40; formerly the interim
+        // `_norealize` name) never dispatches, and the broker itself
+        // remains unregistered (paideia-os R48-PREP-005) -- diagnostic-
+        // branch on it so a maintainer knows the elevate reply is the
+        // missing piece rather than a txn-model bug. All other high-
+        // band returns hit the generic TXN error path.
         mov r11, 256;                        // TXN_SLOT_CAP_MAX
         cmp r14, r11;
         jb  pi_txn_open_ok;

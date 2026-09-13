@@ -1,0 +1,358 @@
+// src/verify.pdx -- pkg.ENH-004 (#29)
+// PkgVerify module: `pkg verify <name>` real body.
+//
+// Scope
+// -----
+// Replaces the M1-era SubcommandsM1Stubs::pkg_verify_stub with the real
+// verify pipeline. pkg verify re-checks an already-installed package
+// against its shipped manifest.pdxsig -- the cheapest genuine correctness
+// win in the tool (no network, no elevate, the manifest travels with the
+// install). It is also the only subcommand that gives an operator a
+// reason to trust an already-installed package after a root-key
+// rotation.
+//
+// The verify body mirrors pkg_install_body's decode + verify stages
+// (mc_read_header -> mc_verify_body_hash -> mc_verify_signatures) but
+// with none of the mutating steps (no elevate, no txn_open, no mint).
+// When paideia-as v0.33-crypto-kdf lands the SHA-3 and ML-DSA-65
+// intrinsics, the two verify SEAMs stop returning MC_HASH_STUB /
+// MC_VERIFY_STUB and this subcommand becomes truly meaningful without
+// any further shape changes here.
+//
+// Verify flow (mirrors design/manifest-format.md §5 verification
+// algorithm):
+//
+//   1. audit_begin_op(OP_NAME_VERIFY, 0) -- I5 audit-first. On broker
+//      unavailable, exit AUDIT_EXIT_BROKER_FAIL (4) with no output.
+//   2. pos_count == 2 check; pos_ptrs[1] is the package name.
+//   3. Emit progress diagnostic "pkg verify: checking package '<n>'".
+//   4. mc_reset -- clear ParsedManifest singleton.
+//   5. mc_read_header(&_verify_staging) -- populate parsed_* fields.
+//      At HEAD the staging buffer is zero-init .bss (same seam
+//      discipline as install's _install_staging: paideia-os
+//      KIND_PDXFS_FILE staging read is the substrate gate). A real
+//      read fills the buffer from /pkgs/<name>-<version>/manifest.pdxsig
+//      before this step lands its M2 diff-flip.
+//   6. mc_verify_body_hash(body_ptr, body_len) SEAM. Returns
+//      MC_HASH_STUB pending crypto-kdf; we surface that as EXIT_OP_FAIL
+//      with a diagnostic naming the missing intrinsic (I5 refuses a
+//      silent skip).
+//   7. mc_verify_signatures(header, body, body_len, sigblock) SEAM.
+//      Same treatment as step 6.
+//   8. Emit "pkg verify: '<n>': OK\n" on stdout, exit 0.
+//
+// Exit codes:
+//   0 -- verify succeeded (dual-signature check passed)
+//   1 -- op-fail (header parse, hash mismatch, or sig verify refused);
+//        diagnostic on stderr names the failing step
+//   2 -- usage error (wrong pos_count, malformed positional)
+//   4 -- audit broker unavailable (AUDIT_EXIT_BROKER_FAIL, ENH-003 #28)
+//
+// paideia-as compliance -- same as PkgInstall / PkgRemove:
+//   - Module PkgVerify (PascalCase basename).
+//   - No `test` mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg,imm <= 0x7FFFFFFF (large-imm return codes staged
+//     via r11).
+//   - r11 scratch; byte reads via xor rax,rax + mov_b (paideia-as
+//     #1248 mitigation).
+//   - 3-push callee-save prologue (rbx=name_ptr, r12=seam rc,
+//     r13=exit code); an odd 3-push count carries rsp%16 8 -> 0
+//     without a pad slot, matching install.pdx's 5-push discipline.
+//   - Labels prefixed pv_ (distinct from the pkg_verify_stub prefix
+//     the retired stub used).
+
+module Verify = structure {
+
+  // ---- Diagnostic strings ---------------------------------------------
+  pub let VERIFY_USAGE_MSG : [u8; 31] =
+    "usage: pkg verify <name>\n(pkg)\n"
+  pub let VERIFY_USAGE_MSG_LEN : u64 = 31
+
+  pub let VERIFY_STAGE_MSG_1 : [u8; 30] =
+    "pkg verify: checking package '"
+  pub let VERIFY_STAGE_MSG_1_LEN : u64 = 30
+  pub let VERIFY_STAGE_MSG_2 : [u8; 2] = "'\n"
+  pub let VERIFY_STAGE_MSG_2_LEN : u64 = 2
+
+  pub let VERIFY_ERR_HEADER : [u8; 44] =
+    "pkg verify: header parse failed (see errno)\n"
+  pub let VERIFY_ERR_HEADER_LEN : u64 = 44
+
+  pub let VERIFY_ERR_HASH : [u8; 79] =
+    "pkg verify: body hash unavailable (paideia-as v0.33-crypto-kdf required)\n(pkg)\n"
+  pub let VERIFY_ERR_HASH_LEN : u64 = 79
+
+  pub let VERIFY_ERR_VERIFY : [u8; 79] =
+    "pkg verify: signature unavailable (paideia-as v0.33-crypto-kdf required)\n(pkg)\n"
+  pub let VERIFY_ERR_VERIFY_LEN : u64 = 79
+
+  pub let VERIFY_OK_MSG_1 : [u8; 13] = "pkg verify: '"
+  pub let VERIFY_OK_MSG_1_LEN : u64 = 13
+  pub let VERIFY_OK_MSG_2 : [u8; 6]  = "': OK\n"
+  pub let VERIFY_OK_MSG_2_LEN : u64 = 6
+
+  // ---- Verify-progress state (populated across the pipeline) ---------
+  pub let mut verify_name_ptr    : u64 = uninit @align(8)
+  pub let mut verify_manifest_rc : u64 = uninit @align(8)
+  pub let mut verify_step        : u64 = uninit @align(8)
+
+  // audit_id for the I5 begin/commit pair. Mirrors _install_audit_id /
+  // _remove_audit_id in install.pdx / remove.pdx.
+  pub let mut _verify_audit_id : u64 = uninit @align(8)
+
+  pub let VERIFY_STEP_NONE   : u64 = 0
+  pub let VERIFY_STEP_HEADER : u64 = 1
+  pub let VERIFY_STEP_HASH   : u64 = 2
+  pub let VERIFY_STEP_VERIFY : u64 = 3
+  pub let VERIFY_STEP_OK     : u64 = 4
+
+  // Staging buffer -- mirrors _install_staging (64B header + 4KiB body
+  // ceiling per MC_BODY_LEN_MAX). At HEAD this stays zero-init and
+  // mc_read_header refuses at the magic check; the KIND_PDXFS_FILE
+  // staging read (paideia-os R42-PREP-006) is the substrate gate that
+  // fills it. Independent from install's buffer so a caller who runs
+  // both subcommands in one process (a test harness) does not race on
+  // shared .bss.
+  pub let mut _verify_staging : [u8; 4160] = uninit @align(64)
+
+  // ==========================================================================
+  // verify_reset() -> ()
+  //
+  // Clear every verify_* .bss slot so a subsequent pkg_verify_body call
+  // starts from a known baseline. Leaf function; r11 scratch.
+  // ==========================================================================
+  pub let verify_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pkg.ENH-004 (#29) verify_reset: zero every verify-progress slot so a subsequent pkg_verify_body call sees a known-empty state. Mirror of install_reset / remove_reset shape. Leaf function; r11 scratch used only for the lea. Labels: none.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + verify_name_ptr];    mov [r11], rax;
+        lea r11, [rip + verify_manifest_rc]; mov [r11], rax;
+        lea r11, [rip + verify_step];        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pkg_verify_body() -> exit_code
+  //
+  // Signature: pkg_verify_body : () -> u64 !{mem, sysreg} @{cap, sched}
+  //
+  // Reads ParsedArgs::pos_count + ParsedArgs::pos_ptrs[1], then walks
+  // the decode + verify pipeline documented in the module preamble.
+  // Every step's return code updates verify_manifest_rc / verify_step
+  // so a test harness can inspect where the pipeline exited.
+  //
+  // Register plan (3 callee-save pushes = 24 bytes; no pad):
+  //   rbx = pos_ptrs[1]      (name; survives every nested call)
+  //   r12 = ManifestCodec rc (rax cache across print calls)
+  //   r13 = final exit code accumulator (0 ok / 1 op-fail / 2 usage)
+  //   Entry rsp%16 == 8; three 8-byte pushes flip rsp%16 8 -> 0 -> 8 ->
+  //   0, matching every nested call's alignment invariant. Same
+  //   discipline as install.pdx's "5 pushes are exactly right" note --
+  //   an odd number of pushes gives the alignment on its own.
+  //
+  // Effects tail: !{mem, sysreg} @{cap, sched} matches AuditClient's
+  // send/recv effect + broker cap + sched wake -- same shape the
+  // install / remove / list bodies declare after M3-003.
+  // ==========================================================================
+  pub let pkg_verify_body : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.ENH-004 (#29) pkg_verify_body: real body replacing SubcommandsM1Stubs::pkg_verify_stub. Audit-first via AuditWire::audit_begin_op BEFORE any argv check or output; broker unavailable exits AUDIT_EXIT_BROKER_FAIL (4) without touching stdout/stderr. Pipeline: pos_count==2 check -> mc_reset -> mc_read_header (from _verify_staging .bss; the KIND_PDXFS_FILE staging read at paideia-os R42-PREP-006 fills the buffer in a follow-up diff, unchanged seam shape) -> mc_verify_body_hash SEAM -> mc_verify_signatures SEAM -> OK diagnostic. Any SEAM returning *_STUB collapses to EXIT_OP_FAIL (1) with a diagnostic naming the missing intrinsic (I5 refuses a silent skip); any MC_ERR_* header/hash/sig code also collapses to EXIT_OP_FAIL with an actionable diagnostic. audit_commit_op fires at every exit path (including refusals) so the audit ledger sees a matched INVOKE/EXIT pair per I5. 3 callee-save pushes (rbx=name_ptr, r12=seam rc, r13=exit) flip rsp%16 8 -> 0 -> 8 -> 0 -- odd push count aligns on its own, matching install.pdx's 5-push discipline; NO pad slot. Effects tail !{mem, sysreg} @{cap, sched} matches AuditClient's tail. Labels prefixed pv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        // 3 pushes: rsp%16 flips 8 -> 0 -> 8 -> 0. No pad needed.
+
+        // ---- Audit-first (I5) -----------------------------------------
+        lea rdi, [rip + OP_NAME_VERIFY];
+        xor rsi, rsi;
+        call audit_begin_op;
+        cmp rax, 0;
+        je  pv_broker_fail;
+        lea r11, [rip + _verify_audit_id];
+        mov [r11], rax;
+
+        // Reset progress state.
+        call verify_reset;
+        call mc_reset;
+
+        xor r13, r13;                        // exit code = 0 (OK)
+
+        // Step 1: pos_count == 2 check.
+        lea r11, [rip + pos_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne pv_usage_error;
+
+        // Step 1a: load pos_ptrs[1] -> rbx.
+        lea r11, [rip + pos_ptrs];
+        mov rbx, [r11 + 8];                  // pos_ptrs[1]
+        cmp rbx, 0;
+        je  pv_usage_error;
+
+        // Persist name pointer.
+        lea r11, [rip + verify_name_ptr];
+        mov [r11], rbx;
+
+        // Step 2: progress diagnostic on stdout.
+        lea rdi, [rip + VERIFY_STAGE_MSG_1];
+        mov rsi, 30;                         // VERIFY_STAGE_MSG_1_LEN
+        call print_str;
+
+        // Walk name to NUL for length.
+        mov rdx, rbx;
+      pv_name_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je  pv_name_walk_done;
+        add rdx, 1;
+        jmp pv_name_walk;
+      pv_name_walk_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call print_str;
+
+        lea rdi, [rip + VERIFY_STAGE_MSG_2];
+        mov rsi, 2;                          // VERIFY_STAGE_MSG_2_LEN
+        call print_str;
+
+        // Step 3: read header from staging buffer.
+        mov r11, 1;                          // VERIFY_STEP_HEADER
+        lea rax, [rip + verify_step];
+        mov [rax], r11;
+
+        lea rdi, [rip + _verify_staging];
+        call mc_read_header;
+        mov r12, rax;
+        lea r11, [rip + verify_manifest_rc];
+        mov [r11], r12;
+
+        cmp r12, 0;                          // MC_OK == 0
+        jne pv_err_header;
+
+        // Step 4: body hash SEAM.
+        mov r11, 2;                          // VERIFY_STEP_HASH
+        lea rax, [rip + verify_step];
+        mov [rax], r11;
+
+        lea rdi, [rip + _verify_staging];
+        add rdi, 64;                         // body_ptr = staging + 64
+        lea r11, [rip + parsed_body_len];
+        mov rsi, [r11];                      // body_len
+        call mc_verify_body_hash;
+        mov r12, rax;
+        lea r11, [rip + verify_manifest_rc];
+        mov [r11], r12;
+
+        cmp r12, 0;
+        jne pv_err_hash;
+
+        // Step 5: signatures SEAM.
+        mov r11, 3;                          // VERIFY_STEP_VERIFY
+        lea rax, [rip + verify_step];
+        mov [rax], r11;
+
+        lea rdi, [rip + _verify_staging];    // header_ptr
+        mov rsi, rdi;
+        add rsi, 64;                         // body_ptr
+        lea r11, [rip + parsed_body_len];
+        mov rdx, [r11];                      // body_len
+        mov rcx, rsi;
+        add rcx, rdx;                        // sigblock_ptr = body + body_len
+        call mc_verify_signatures;
+        mov r12, rax;
+        lea r11, [rip + verify_manifest_rc];
+        mov [r11], r12;
+
+        cmp r12, 0;
+        jne pv_err_verify;
+
+        // Success. Print "pkg verify: '<name>': OK\n".
+        mov r11, 4;                          // VERIFY_STEP_OK
+        lea rax, [rip + verify_step];
+        mov [rax], r11;
+
+        lea rdi, [rip + VERIFY_OK_MSG_1];
+        mov rsi, 13;                         // VERIFY_OK_MSG_1_LEN
+        call print_str;
+
+        mov rdx, rbx;
+      pv_ok_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je  pv_ok_walk_done;
+        add rdx, 1;
+        jmp pv_ok_walk;
+      pv_ok_walk_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call print_str;
+
+        lea rdi, [rip + VERIFY_OK_MSG_2];
+        mov rsi, 6;                          // VERIFY_OK_MSG_2_LEN
+        call print_str;
+
+        xor r13, r13;                        // EXIT_OK
+        jmp pv_epilogue;
+
+        // ==== error branches ============================================
+      pv_usage_error:
+        lea rdi, [rip + VERIFY_USAGE_MSG];
+        mov rsi, 31;                         // VERIFY_USAGE_MSG_LEN
+        call print_err;
+        mov r13, 2;                          // EXIT_USAGE
+        jmp pv_epilogue;
+
+      pv_err_header:
+        lea rdi, [rip + VERIFY_ERR_HEADER];
+        mov rsi, 44;                         // VERIFY_ERR_HEADER_LEN
+        call print_err;
+        mov r13, 1;                          // EXIT_OP_FAIL
+        jmp pv_epilogue;
+
+      pv_err_hash:
+        lea rdi, [rip + VERIFY_ERR_HASH];
+        mov rsi, 79;                         // VERIFY_ERR_HASH_LEN
+        call print_err;
+        mov r13, 1;
+        jmp pv_epilogue;
+
+      pv_err_verify:
+        lea rdi, [rip + VERIFY_ERR_VERIFY];
+        mov rsi, 79;                         // VERIFY_ERR_VERIFY_LEN
+        call print_err;
+        mov r13, 1;
+
+      pv_epilogue:
+        // ---- I5 audit_commit -------------------------------------------
+        lea r11, [rip + _verify_audit_id];
+        mov rdi, [r11];                      // audit_id
+        mov rsi, r13;                        // exit_code
+        call audit_commit_op;
+
+        mov rax, r13;                        // exit code
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pv_broker_fail:
+        // I5 refusal: audit broker unavailable, no output was emitted
+        // between audit_begin_op's fallback diagnostic and here. No
+        // audit_commit (audit was never begun). Exit 4 per ENH-003.
+        mov rax, 4;                          // AUDIT_EXIT_BROKER_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
