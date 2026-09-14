@@ -18,22 +18,27 @@
 //      same wrapper install uses; result in remove_parent_slot). Wired
 //      ahead of the lookup gate closing so remove never gains a live
 //      unelevated destructive path.
-//   3. Look up the installed version via /system/packages/<name>-*
-//      (STUB at M2 -- KIND_PDXFS_FILE has no readdir op; the M2 shape
-//      hard-codes a lookup miss which fails-safe).
-//   4. Open KIND_PDXFS_TXN(mode=DELETE) via TxnClient::txn_open (SEAM),
-//      threading remove_parent_slot the same way install threads
-//      install_parent_slot.
-//   5. Serialise the reverse-symlink undo record into the process's
-//      undo-scratch buffer (REAL byte layout at M2 -- shape is stable).
-//   6. Move /pkgs/<name>-<version>/ into
-//      /system/trash/<remove_id>-<name>-<version>/ via a per-file txn
-//      write per the parent's FILE_INVENTORY (STUB at M2 -- one write
-//      per record shape lives at M4 alongside the fixture manifest).
+//   3. Resolve <name> against /system/packages/index.pdxlist and load
+//      its recorded file list into _remove_inventory via
+//      remove_lookup_files (SEAM at R70.M1-005 -- pkg holds no
+//      KIND_PDXFS_FILE cap for /system/packages/; fails closed).
+//   4. Open KIND_PDXFS_TXN(mode=DELETE) via TxnClient::txn_open (REAL
+//      syscall #70), threading remove_parent_slot the same way install
+//      threads install_parent_slot.
+//   5. Serialise the pdxundo header into the process's undo-scratch
+//      buffer via ur_write_header (REAL). Ordered BEFORE any deletion:
+//      an undo record written afterwards is unrecoverable exactly when
+//      it is needed.
+//   6. Unlink every path in _remove_inventory through
+//      TxnClient::txn_unlink -- PXT_OP_UNLINK inside the transaction
+//      opened at step 4, so a failure at any file rolls the whole set
+//      back (SEAM at R70.M1-005 -- the op is real kernel-side but its
+//      operand-staging call has no syscall binding; fails closed).
 //   7. Write the undo record to /journal/pkg/remove-<remove_id>.pdxundo
-//      (STUB at M2 -- KIND_PDXFS_FILE write op deferred to R42-PREP-007).
-//   8. Commit txn.
-//   9. Exit 0.
+//      (STUB -- KIND_PDXFS_FILE write op; lands with the M4 trash-move).
+//   8. Commit txn -- this is also where the registry deregistration
+//      becomes visible, staged in the same transaction as the unlinks.
+//   9. Emit "pkg remove: ok -- name='<name>' files=<N>"; exit 0.
 //
 //   On failure: txn_abort; exit 1 (EXIT_OP_FAIL) with a diagnostic
 //   naming the failing step.
@@ -65,6 +70,79 @@
 // trash paths, and reinstalls from the trash subtree without needing
 // pkgs.paideia-os connectivity.
 //
+// ==========================================================================
+// R70.M1-005 (#22) -- what this round changed, and what it refused to
+// ==========================================================================
+//
+// #22 as filed asked for: parse `/var/pkg/installed.pdxpkg`, iterate
+// the entry's file list, `sys_unlink` each path, append a libpdx-audit
+// record of kind `UNINSTALL`, and rewrite the registry without that
+// entry. Three of those five are not implementable as stated against
+// this repo's shipped substrate, and the fourth is already shipped.
+// Each is dispositioned below; design/remove-flow.md §8 is the full
+// record.
+//
+//   1. `/var/pkg/installed.pdxpkg` -- RETIRED, not missing.
+//      design/enh-001-reconciliation.md §2.1 ("Install root" row) folds
+//      the registry-file idea into "what /system/packages/index.pdxlist
+//      already is" rather than standing up a second registry. Adding
+//      installed.pdxpkg back would give pkg two disagreeing sources of
+//      truth for "what is installed" with no reconciler between them.
+//      remove_lookup_files below therefore names index.pdxlist.
+//
+//   2. Per-file `sys_unlink` (syscall #81) -- AVAILABLE BUT REFUSED.
+//      It is ambient write authority on /pkgs, which D4 forbids for
+//      every mutating pkg path (this is the whole reason the elevate
+//      stage exists at step 2), and it is non-transactional: a failure
+//      partway through an N-file loop leaves a half-removed package
+//      with no undo record, which remove-flow.md §7 states outright is
+//      impossible-by-construction here ("a remove that cannot produce
+//      an undo record MUST refuse"). The capability-correct primitive
+//      is TxnClient::txn_unlink -- PXT_OP_UNLINK (11) inside the
+//      already-open TXN_MODE_DELETE transaction -- which is what
+//      remove_unlink_all drives.
+//
+//   3. Audit kind `UNINSTALL` -- DOES NOT EXIST. The only UEJ_KIND_*
+//      constants reachable from a tool are TOOL_INVOKE (130),
+//      TOOL_OUTPUT (132), TOOL_EXIT (133) and ELEVATE (5); libpdx-audit
+//      distinguishes operations by the op_name column, not by minting
+//      a kind per verb. pkg already emits TOOL_INVOKE/TOOL_EXIT with
+//      op_name = "remove" (OP_NAME_REMOVE), which IS the uninstall
+//      audit record. The sibling tool mkfs.pdxfs hit the identical
+//      "issue names a UEJ_KIND that does not exist" situation and
+//      resolved it the same way (see its src/audit_wire.pdx L35-59).
+//      What was genuinely MISSING is the output half: ENH-012 (#37)
+//      wired audit_record_op_output into install and list and skipped
+//      remove, so a removal's audit entry carried an empty
+//      output_schema column. That is fixed here -- remove now binds
+//      and records pdxsig.pkg.rpr.v1 and emits one RemoveProgress
+//      record per stage, exactly as install does. "Reverse install via
+//      libpdx-audit" now means what it should: remove is
+//      audit-symmetric with install.
+//
+//   4. Deregister the entry -- the registry write is downstream of the
+//      same index.pdxlist seam as the lookup in (1); it is staged in
+//      the same transaction as the unlinks by construction, so there
+//      is no window in which the files are gone but the registry still
+//      claims the package is installed.
+//
+// Net: the pipeline below is now END-TO-END REAL except for two named
+// upstream gaps, and it fails closed at both:
+//
+//   * LOOKUP  -- no reader for /system/packages/index.pdxlist (pkg has
+//     no KIND_PDXFS_FILE cap for /system/packages/ seeded via InitCap;
+//     same gap list.pdx L198-202 documents).
+//   * UNLINK  -- PXT_OP_UNLINK is real kernel-side (paideia-os
+//     R52.M6-003 #1711) but unreachable from userspace: its operands
+//     travel through pdxfs_txn_stage_unlink_name, which has no syscall
+//     binding. See TxnClient::TXN_UNLINK_UNSTAGED.
+//
+// Everything between and around them -- elevate, txn_open(DELETE),
+// undo-header serialisation, the per-file unlink loop, txn_commit, the
+// abort-on-any-failure cleanup, the audit and record streams, and the
+// `files=<N>` fingerprint -- is wired and exercised. Closing either
+// gap upstream is a one-function edit here, not a restructure.
+//
 // paideia-as compliance -- same as PkgInstall.
 
 module Remove = structure {
@@ -84,6 +162,20 @@ module Remove = structure {
   pub let UR_ERR_BUF_TOO_SMALL : u64 = 0xFFFFEB80
   pub let UR_ERR_BAD_ARG       : u64 = 0xFFFFEB81
 
+  // R70.M1-005 (#22) -- lookup-stage vocabulary. Kept in the same
+  // 0xFFFFEB8x band as the undo-record codes so a caller reading a
+  // RemoveProgressRecord's rc lane can classify by band alone.
+  //
+  // REMOVE_LOOKUP_UNAVAILABLE is deliberately DISTINCT from "package
+  // not installed": the first is a substrate gap (pkg cannot read the
+  // registry at all), the second is a legitimate answer to a legitimate
+  // question. Collapsing them would make `pkg remove nonexistent`
+  // indistinguishable from `pkg remove` on a host whose registry is
+  // unreadable -- the first should exit non-zero and stay exited, the
+  // second becomes a no-op success once the seam closes.
+  pub let REMOVE_LOOKUP_UNAVAILABLE : u64 = 0xFFFFEB82
+  pub let REMOVE_ERR_INV_OVERFLOW   : u64 = 0xFFFFEB83
+
   // ---- Diagnostic strings ---------------------------------------------
   pub let REMOVE_USAGE_MSG : [u8; 31] =
     "usage: pkg remove <name>\n(pkg)\n"
@@ -95,13 +187,35 @@ module Remove = structure {
   pub let REMOVE_STAGE_MSG_2 : [u8; 2] = "'\n"
   pub let REMOVE_STAGE_MSG_2_LEN : u64 = 2
 
-  pub let REMOVE_ERR_LOOKUP : [u8; 63] =
-    "pkg remove: /system/packages/ readdir unavailable at M2 (R42)\n\n"
-  pub let REMOVE_ERR_LOOKUP_LEN : u64 = 63
+  // R70.M1-005 (#22): re-aimed from "/system/packages/ readdir" at the
+  // actual registry ENH-001 §2.1 settled on. The blocker is not readdir
+  // (KIND_PDXFS_FILE.readnext landed at R42-PREP-008) -- it is that pkg
+  // holds no KIND_PDXFS_FILE cap for /system/packages/, so it cannot
+  // open index.pdxlist to read at all. Naming the right blocker matters:
+  // an operator who reads the old message goes looking upstream for a
+  // readdir op that already exists.
+  pub let REMOVE_ERR_LOOKUP : [u8; 61] =
+    "pkg remove: /system/packages/index.pdxlist read unavailable\n\n"
+  pub let REMOVE_ERR_LOOKUP_LEN : u64 = 61
 
-  pub let REMOVE_ERR_TXN : [u8; 65] =
+  // R70.M1-005 (#22): the per-file deletion seam. Distinct from the
+  // TXN diagnostic below because the transaction opened FINE -- what
+  // refused is the unlink op inside it.
+  pub let REMOVE_ERR_UNLINK : [u8; 58] =
+    "pkg remove: txn unlink unavailable -- no staging syscall\n\n"
+  pub let REMOVE_ERR_UNLINK_LEN : u64 = 58
+
+  // NB (R70.M1-005 #22): this was declared [u8; 65] with a _LEN of 65
+  // against a literal that is 64 bytes -- print_err would read one byte
+  // past the string into whatever .rodata followed it. Latent at M2
+  // because the unconditional `jmp pr_err_lookup` made pr_err_txn
+  // unreachable; LIVE as of this round, since txn_open now actually
+  // runs and refuses with PXT_MINT_BAD_PARENT while the elevate broker
+  // stays unregistered. Corrected to 64. (install.pdx's INSTALL_ERR_TXN
+  // is a different string and is correctly 65 -- checked, not assumed.)
+  pub let REMOVE_ERR_TXN : [u8; 64] =
     "pkg remove: KIND_PDXFS_TXN unavailable (R42-PREP-007 required)\n\n"
-  pub let REMOVE_ERR_TXN_LEN : u64 = 65
+  pub let REMOVE_ERR_TXN_LEN : u64 = 64
 
   pub let REMOVE_ERR_UNDO : [u8; 60] =
     "pkg remove: undo record write failed -- refuse per I5\n(pkg)\n"
@@ -118,11 +232,36 @@ module Remove = structure {
     "' (no side effects)\n"
   pub let REMOVE_DRY_RUN_MSG_2_LEN : u64 = 20
 
+  // R70.M1-005 (#22) success fingerprint, per the issue's own
+  // "pkg remove ok -- name=<name> files=<N>" wording. Three pieces
+  // around the name and the decimal count (paideia-as string literals
+  // do not concatenate; this repo's one-constant-per-fragment
+  // convention applies -- see PkgMain's HELP_LINE_* family).
+  //
+  // The same (name, N) pair also leaves on the typed side of stdout as
+  // a RemoveProgressRecord, so a supervisor never has to scrape this
+  // line to learn a remove's blast radius.
+  pub let REMOVE_OK_MSG_1 : [u8; 24] =
+    "pkg remove: ok -- name='"
+  pub let REMOVE_OK_MSG_1_LEN : u64 = 24
+  pub let REMOVE_OK_MSG_2 : [u8; 8] = "' files="
+  pub let REMOVE_OK_MSG_2_LEN : u64 = 8
+  pub let REMOVE_OK_MSG_3 : [u8; 1] = "\n"
+  pub let REMOVE_OK_MSG_3_LEN : u64 = 1
+
   // ---- Remove-progress state (populated across the pipeline) ----------
   pub let mut remove_name_ptr     : u64 = uninit @align(8)
   pub let mut remove_id           : u64 = uninit @align(8)
   pub let mut remove_txn_slot     : u64 = uninit @align(8)
   pub let mut remove_step         : u64 = uninit @align(8)
+
+  // R70.M1-005 (#22): shared rc lane, the exact counterpart of
+  // install.pdx's install_manifest_rc. Every stage parks its return
+  // code here before calling ps_emit_remove_progress (which clobbers
+  // rax) and reloads it for the branch. Using .bss rather than another
+  // callee-save register keeps the five-register body plan intact --
+  // rbx/r12/r13/r14/r15 are all already spoken for.
+  pub let mut remove_last_rc      : u64 = uninit @align(8)
 
   // ENH-008 (#33): parent_slot returned by PkgElevate::
   // pkg_elevate_request_pdxfs_write_pkgs. Mirrors install_parent_slot
@@ -154,13 +293,45 @@ module Remove = structure {
   // in src/install.pdx for the same discipline.
   pub let mut _remove_audit_id : u64 = uninit @align(8)
 
+  // ---- R70.M1-005 (#22): the package's recorded file inventory -------
+  // remove_lookup_files populates this from the registry entry;
+  // remove_unlink_all walks it. One entry = two qwords (path_ptr,
+  // path_len) -> stride 16, so the index math is a single `shl r, 4`
+  // with no imul (the 2-operand `imul r, imm` form is a known
+  // paideia-as encoder hazard and is avoided throughout this repo).
+  //
+  // 64 entries is a deliberate hard cap rather than a growable list:
+  // a bounded .bss table means the unlink loop cannot be driven past
+  // its own storage by a malformed or hostile registry entry, and a
+  // package that genuinely exceeds it refuses loudly
+  // (REMOVE_ERR_INV_OVERFLOW) rather than silently removing a prefix
+  // of its own files -- a partial remove is exactly the I5 violation
+  // this whole path exists to prevent. The M4 fixture packages have
+  // <= 16 files; revisit the cap with evidence, not in advance.
+  pub let REMOVE_FILE_MAX : u64 = 64
+  pub let mut remove_file_count : u64 = uninit @align(8)
+  pub let mut _remove_inventory : [u64; 128] = uninit @align(64)
+
+  // 16B zero blob passed as ur_write_header's body_sha3_ptr while the
+  // body loop is empty (body_len == 0, so sha3(empty) is not yet
+  // meaningful). Explicitly zeroed by remove_reset rather than trusted
+  // to .bss zero-fill -- this value lands in a durable undo record
+  // that a future `undo` verifies against, so an indeterminate two
+  // qwords here would surface as an unexplainable integrity refusal.
+  pub let mut _undo_body_sha3 : [u8; 16] = uninit @align(8)
+
+  // Decimal staging for remove_print_u64 -- 20 bytes is exactly the
+  // digit count of 2^64-1 (18446744073709551615), so no overflow check
+  // is needed inside the digit loop.
+  pub let mut _remove_num_buf : [u8; 20] = uninit @align(8)
+
   // ==========================================================================
   // remove_reset() -> ()
   // ==========================================================================
   pub let remove_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "pkg.M2-004 remove_reset, widened at ENH-008 (#33): zero every remove-progress slot, including remove_parent_slot so a leftover elevate grant from a previous call cannot leak into a fresh txn_open. _remove_id_counter is NOT zeroed here -- it is a process-lifetime monotonic; the M4 test harness resets it explicitly when it wants a clean slate. Leaf function.",
+      justification: "pkg.M2-004 remove_reset, widened at ENH-008 (#33) and again at R70.M1-005 (#22): zero every remove-progress slot, including remove_parent_slot so a leftover elevate grant from a previous call cannot leak into a fresh txn_open, remove_file_count so a stale count cannot drive remove_unlink_all over inventory entries this call never populated (the single most dangerous stale-state bug on this path -- it would unlink the PREVIOUS package's files), and the two _undo_body_sha3 qwords because that value lands in a durable undo record a future `undo` verifies against. The _remove_inventory table itself is NOT bulk-zeroed: remove_file_count bounds every read of it, so zeroing 1KiB per call would buy nothing over zeroing the bound. _remove_id_counter is NOT zeroed here -- it is a process-lifetime monotonic; the M4 test harness resets it explicitly when it wants a clean slate. Leaf function.",
       block: {
         xor rax, rax;
         lea r11, [rip + remove_name_ptr];    mov [r11], rax;
@@ -168,6 +339,11 @@ module Remove = structure {
         lea r11, [rip + remove_txn_slot];    mov [r11], rax;
         lea r11, [rip + remove_step];        mov [r11], rax;
         lea r11, [rip + remove_parent_slot]; mov [r11], rax;
+        lea r11, [rip + remove_file_count];  mov [r11], rax;
+        lea r11, [rip + remove_last_rc];     mov [r11], rax;
+        lea r11, [rip + _undo_body_sha3];
+        mov [r11 + 0], rax;
+        mov [r11 + 8], rax;
         ret
       }
     }
@@ -256,6 +432,234 @@ module Remove = structure {
     }
 
   // ==========================================================================
+  // remove_print_u64(v) -> ()
+  //
+  // R70.M1-005 (#22). Emit an unsigned 64-bit value on stdout in
+  // decimal, for the `files=<N>` half of the success fingerprint.
+  //
+  // Why this exists here rather than as a shared helper: pkg had no
+  // number formatter at all before this round (every diagnostic was a
+  // fixed .rodata string), and one call site does not justify a new
+  // module. If a second subcommand needs it, lift it into Print --
+  // that is a mechanical move, and doing it speculatively now would
+  // widen Print's surface for a single user.
+  //
+  // Algorithm is the tree's established one (see mount.pdxfs
+  // src/mount_record.pdx L399-441 and mkfs.pdxfs src/format_record.pdx
+  // L245-260): divide by 10 repeatedly, storing remainders right-to-
+  // left into a staging buffer, then one write of the resulting span.
+  // `div rcx` with rdx pre-zeroed is the idiom those files use; it is
+  // the only division in this repo.
+  //
+  // Buffer is .bss rather than stack (the sibling tools stage on the
+  // stack) because this body calls Print::print_str rather than
+  // issuing sys_write inline, and a .bss span keeps the pointer valid
+  // across that call without a second alignment argument.
+  //
+  // Register plan: 1 push (rbx, unused body-side) flips rsp%16 8 -> 0
+  // for the nested print_str call. r9 = remaining value, r10 = write
+  // cursor, rax/rcx/rdx consumed by div.
+  // ==========================================================================
+  pub let remove_print_u64 : (u64) -> () !{mem, sysreg} @{cap, sched} =
+    fn (v: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "pkg.R70.M1-005 (#22) remove_print_u64: u64 -> decimal on stdout via Print::print_str. Mirrors the div-by-10 digit loop in mount.pdxfs/src/mount_record.pdx and mkfs.pdxfs/src/format_record.pdx one-for-one (mov rcx,10; xor rdx,rdx; div rcx; add rdx,0x30; byte-store dl; cursor moves MSB-ward) -- copied rather than re-derived so the one division site in this repo matches two already-working ones. v == 0 is special-cased to a single '0' because the loop as written would emit nothing for it. _remove_num_buf is 20 bytes = exactly the digit count of 2^64-1, so the cursor cannot walk below the buffer and no bound check is needed. Length is computed as (buf_end - cursor) where buf_end = buf + 20, matching the sibling implementations' (rsp+20)-r10. One push (rbx, unused) keeps rsp%16 == 0 for the nested print_str call. Effects tail matches print_str's caller-visible chain. Labels prefixed rpu_.",
+      block: {
+        push rbx;
+
+        cmp rdi, 0;
+        jne rpu_setup;
+
+        // Zero special case: a single '0' digit.
+        lea r11, [rip + _remove_num_buf];
+        mov al, 0x30;                        // ASCII '0'
+        mov [r11], al;
+        mov rdi, r11;
+        mov rsi, 1;
+        call print_str;
+        pop rbx;
+        ret;
+
+      rpu_setup:
+        mov r9, rdi;                         // r9 = remaining value
+        lea r10, [rip + _remove_num_buf];
+        add r10, 19;                         // cursor at last staging byte
+
+      rpu_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                        // zero-extend rdx:rax for div
+        div rcx;                             // rax = quotient, rdx = remainder
+        add rdx, 0x30;                       // digit -> ASCII '0'..'9'
+        mov [r10], dl;                       // store at cursor
+        mov r9, rax;                         // r9 = quotient
+        cmp r9, 0;
+        je  rpu_emit;
+        sub r10, 1;                          // advance cursor left (MSB-ward)
+        jmp rpu_loop;
+
+      rpu_emit:
+        // r10 points at the first (MSB) digit. len = (buf + 20) - r10.
+        lea rax, [rip + _remove_num_buf];
+        add rax, 20;
+        sub rax, r10;                        // rax = digit count
+        mov rdi, r10;                        // buf
+        mov rsi, rax;                        // len
+        call print_str;
+
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // remove_lookup_files(name_ptr) -> count
+  //                                | UR_ERR_BAD_ARG
+  //                                | REMOVE_LOOKUP_UNAVAILABLE
+  //
+  // R70.M1-005 (#22). Resolve <name> against the installed-package
+  // registry and populate _remove_inventory / remove_file_count with
+  // the paths that package owns. Returns the file count on success.
+  //
+  // This replaces the unconditional `jmp pr_err_lookup` the M2 body
+  // carried -- that comment said outright "when the substrate lands,
+  // this jmp is replaced with the real lookup call", so the seam is
+  // now a real function with the real signature and the refusal lives
+  // in its return value. Closing the gap upstream is an edit to THIS
+  // body and nothing else.
+  //
+  // Registry: /system/packages/index.pdxlist, per
+  // design/enh-001-reconciliation.md §2.1 -- NOT a separate
+  // /var/pkg/installed.pdxpkg, which that record retired rather than
+  // deferred. See this file's R70.M1-005 preamble note (1).
+  //
+  // CURRENT STATE: SEAM. pkg holds no KIND_PDXFS_FILE capability for
+  // /system/packages/ (no InitCap sidecar entry seeds one), so it
+  // cannot open index.pdxlist to read. The readdir/readnext op itself
+  // is NOT the blocker -- that landed at R42-PREP-008; the cap is.
+  //
+  // Fails CLOSED: returning REMOVE_LOOKUP_UNAVAILABLE (rather than 0,
+  // "no files") is load-bearing. A zero return would let the pipeline
+  // proceed to open a DELETE transaction, write an undo record
+  // describing nothing, commit it, and report success for a package it
+  // never touched -- I5's exact failure mode. The caller must treat
+  // this sentinel as fatal.
+  //
+  // Leaf; r11 scratch; no callee-save touched.
+  // ==========================================================================
+  pub let remove_lookup_files : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (name_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "pkg.R70.M1-005 (#22) remove_lookup_files: registry lookup seam for /system/packages/index.pdxlist. Validates name_ptr != 0 (UR_ERR_BAD_ARG), zeroes remove_file_count so a caller that ignores the return value still cannot drive remove_unlink_all off stale state, then returns REMOVE_LOOKUP_UNAVAILABLE because pkg holds no KIND_PDXFS_FILE cap for /system/packages/ -- the same gap list.pdx L198-202 documents for its own enumerator. Deliberately NOT returning 0: a zero count is a legitimate answer ('package owns no files') that would carry the pipeline all the way to a successful commit of an empty remove, so the substrate gap gets its own sentinel in the 0xFFFFEB8x band. The signature returns the count directly rather than an out-param so the success path is a plain `mov r14, rax`. Effects declare @{cap} for the eventual KIND_PDXFS_FILE read; declaring it now keeps the signature stable when the body lands. Leaf; r11 scratch. Labels prefixed rlf_.",
+      block: {
+        cmp rdi, 0;
+        je  rlf_bad_arg;
+
+        // Zero the count before the refusal: a caller that ignores our
+        // return value must still not find a stale inventory bound.
+        xor rax, rax;
+        lea r11, [rip + remove_file_count];
+        mov [r11], rax;
+
+        // SEAM -- no KIND_PDXFS_FILE cap for /system/packages/.
+        mov rax, 0xFFFFEB82;                 // REMOVE_LOOKUP_UNAVAILABLE
+        ret;
+
+      rlf_bad_arg:
+        mov rax, 0xFFFFEB81;                 // UR_ERR_BAD_ARG
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // remove_unlink_all(txn_slot) -> TXN_OK | first failure rc
+  //
+  // R70.M1-005 (#22). Walk _remove_inventory[0 .. remove_file_count)
+  // and unlink each recorded path through TxnClient::txn_unlink, i.e.
+  // PXT_OP_UNLINK inside the caller's already-open TXN_MODE_DELETE
+  // transaction.
+  //
+  // This is issue #22's steps 2 and 3 ("iterate that entry's recorded
+  // file list; for each installed path, remove it"), expressed with
+  // the transactional primitive instead of a `sys_unlink` loop. The
+  // difference is not stylistic. Because every unlink is staged inside
+  // ONE transaction, the caller's existing txn_abort on any failure
+  // un-does the whole set -- there is no intermediate state in which
+  // some of the package's files are gone. A syscall #81 loop has no
+  // such property: it would commit each deletion the instant it
+  // returns, so a failure at file k leaves files 0..k-1 permanently
+  // gone with no undo record covering them. remove-flow.md §7 states
+  // the invariant this protects.
+  //
+  // FAIL-FAST, NOT BEST-EFFORT: the loop stops at the first refusal
+  // and propagates that rc verbatim. Continuing past a failure to
+  // "remove as much as possible" would maximise the damage that the
+  // subsequent abort has to undo, and would hide which path actually
+  // refused behind whichever one refused last.
+  //
+  // Register plan (3 callee-save pushes = 24 bytes; entry rsp%16 == 8
+  // -> 0 for the nested txn_unlink call):
+  //   rbx = txn slot (survives every iteration's call)
+  //   r12 = loop index i
+  //   r13 = remove_file_count snapshot
+  //   r10/r11 = per-iteration entry address scratch (recomputed after
+  //             each call, which clobbers both)
+  // ==========================================================================
+  pub let remove_unlink_all : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (txn_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "pkg.R70.M1-005 (#22) remove_unlink_all: drive TxnClient::txn_unlink over _remove_inventory[0 .. remove_file_count). Entry stride is 16 bytes (path_ptr, path_len) so the index math is `mov r10, r12; shl r10, 4` -- no imul, avoiding the 2-operand `imul r, imm` encoder hazard. The count is snapshotted into r13 once at entry rather than re-read per iteration: re-reading would let a (hypothetical) reentrant mutation extend the loop past the entries this call validated. Empty inventory returns TXN_OK immediately -- an empty set is vacuously fully unlinked, and the CALLER is responsible for rejecting a zero count as a lookup failure (remove_lookup_files never returns 0 today for exactly that reason). Fail-fast: the first non-TXN_OK rc returns verbatim so the caller's diagnostic names the real refusal and its txn_abort rolls the whole set back; continuing would enlarge the rollback and lose the first error. r10/r11 are recomputed each iteration because txn_unlink clobbers both (r11 is repo-wide scratch). Three callee-save pushes flip rsp%16 8 -> 0 at the nested call. Labels prefixed rua_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // txn slot
+        xor r12, r12;                        // i = 0
+
+        lea r11, [rip + remove_file_count];
+        mov r13, [r11];                      // count snapshot
+
+        cmp r13, 0;
+        je  rua_done_ok;
+
+      rua_loop:
+        cmp r12, r13;
+        jae rua_done_ok;
+
+        // entry = &_remove_inventory + i * 16
+        mov r10, r12;
+        shl r10, 4;
+        lea r11, [rip + _remove_inventory];
+        add r11, r10;
+
+        mov rdi, rbx;                        // slot
+        mov rsi, [r11 + 0];                  // path_ptr
+        mov rdx, [r11 + 8];                  // path_len
+        call txn_unlink;
+        cmp rax, 0;                          // TXN_OK
+        jne rua_fail;
+
+        add r12, 1;
+        jmp rua_loop;
+
+      rua_done_ok:
+        xor rax, rax;                        // TXN_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rua_fail:
+        // rax already carries the first failure rc -- propagate verbatim.
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // pkg_remove_body() -> exit_code
   //
   // Full remove pipeline. Same seam-discipline as PkgInstall: every
@@ -266,15 +670,20 @@ module Remove = structure {
   // Register plan (five callee-save pushes = 40 bytes; rsp%16 flips 8->0
   // for every nested call):
   //   rbx = pos_ptrs[1] (package name)
-  //   r12 = remove_id (assigned at step 1a)
-  //   r13 = TXN slot (0 until opened)
-  //   r14 = scratch for ManifestCodec-style seam returns
+  //   r12 = remove_id (assigned at step 1a; also the txn_id)
+  //   r13 = TXN slot (0xFFFF = none until txn_open succeeds)
+  //   r14 = file count from remove_lookup_files
   //   r15 = exit code accumulator
+  //
+  // Per-stage return codes park in the remove_last_rc .bss lane across
+  // the ps_emit_remove_progress calls (which clobber rax) and are
+  // reloaded for the branch -- the same discipline install.pdx uses
+  // with install_manifest_rc.
   // ==========================================================================
   pub let pkg_remove_body : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "pkg.M3-003 pkg_remove_body, widened at ENH-008 (#33): audit-first via AuditWire::audit_begin_op BEFORE any output. Broker unavailable -> exit 4 (ENH-003 #28) without touching stdout/stderr. audit_id lands in _remove_audit_id .bss so epilogue commits without register-pressure hassle. Effects tail widens to !{mem, sysreg} @{cap, sched} matching AuditClient / PkgElevate. Full pipeline (ENH-008 inserts the elevate stage ahead of lookup): pos_ptrs[1] check -> monotonic remove_id -> PkgElevate::pkg_elevate_request_pdxfs_write_pkgs (result in remove_parent_slot; 0 today, no output) -> lookup SEAM (no readdir at HEAD) -> txn_open(DELETE) -> serialise undo header + body -> trash-move SEAM -> txn_commit. Silent-remove-without-audit would violate I5 as well as I5's undo obligation; silent-remove-without-elevate would violate D4 (no ambient /pkgs write authority) the moment the lookup gate closes. Cleanup: txn_abort on any failure. Five callee-save pushes flip rsp%16 8->0. Labels prefixed pr_.",
+      justification: "pkg.R70.M1-005 (#22) pkg_remove_body, over M3-003 + ENH-008 (#33). Audit-first via AuditWire::audit_begin_op BEFORE any output; broker unavailable -> exit 4 (ENH-003 #28) without touching stdout/stderr; audit_id lands in _remove_audit_id .bss so the epilogue commits without register-pressure hassle. R70.M1-005 adds, in order: (a) PipeSchemas::ps_bind_remove_progress immediately after audit_begin (bind inside the audited window per I5) plus AuditWire::audit_record_op_output recording pdxsig.pkg.rpr.v1 -- ENH-012 (#37) wired this for install and list and skipped remove, leaving the one destructive subcommand with an empty output_schema column; (b) one ps_emit_remove_progress per stage (ELEVATE/LOOKUP/TXN_OPEN/UNDO/TRASH/COMMIT) carrying that stage's real rc, with the rc parked in remove_last_rc across each emit and reloaded for the branch; (c) the M2 unconditional `jmp pr_err_lookup` replaced by a real remove_lookup_files call whose refusal is a return value, refusing on both the 0xFFFFEB8x sentinel band AND a zero count (zero would commit an empty remove under a success exit code); (d) txn_open(TXN_MODE_DELETE) threading remove_parent_slot with txn_id = remove_id; (e) the first-ever call to ur_write_header, ordered BEFORE any unlink so the undo record exists when it is needed (removed_ns = 0 because pkg has no clock wrapper -- an explicit zero beats a fabricated timestamp in a durable record); (f) remove_unlink_all driving TxnClient::txn_unlink (PXT_OP_UNLINK inside the same transaction) rather than a sys_unlink loop, which would be ambient /pkgs authority (D4) and non-atomic (I5); (g) the `pkg remove: ok -- name='<n>' files=<N>` fingerprint via remove_print_u64. Two epilogue bug fixes in step: r13 initialises to 0xFFFF (TXN_SLOT_NONE) instead of 0 so cap_slot 0 is no longer conflated with 'never opened' and leaked un-aborted, and the abort is now gated on r15 != 0 so a clean commit is not followed by an abort that would surface PXT_BAD_TRANSITION. Effects tail !{mem, sysreg} @{cap, sched} matches AuditClient / PkgElevate / PipeSchemas. Five callee-save pushes flip rsp%16 8->0 at every nested call. All immediates within cmp reg,imm <= 0x7FFFFFFF; UR_DEFAULT_RETENTION_NS and the 0xFFFFEB80 band floor stage via r11. Labels prefixed pr_.",
       block: {
         push rbx;
         push r12;
@@ -293,9 +702,41 @@ module Remove = structure {
         lea r11, [rip + _remove_audit_id];
         mov [r11], rax;
 
+        // ---- R70.M1-005 (#22): bind stdout to RemoveProgressRecord ----
+        // Bind fires AFTER audit_begin so the bind's syscall is inside
+        // the audited window (I5 audit-first), matching install.pdx's
+        // ordering exactly. Return code ignored: a bind failure is
+        // non-fatal because every emit downstream also refuses on an
+        // unbound fd, and the text side of stdout/stderr renders either
+        // way (D2).
+        call ps_bind_remove_progress;
+
+        // Record the output schema on the audit entry. ENH-012 (#37)
+        // did this for install and list and SKIPPED remove, so until
+        // now a removal -- the one operation on this tool that destroys
+        // data -- was the only one whose audit entry carried an empty
+        // output_schema column. This is the "append an audit record for
+        // the uninstall" half of #22: the record is the existing
+        // TOOL_INVOKE/TOOL_EXIT pair under op_name = "remove"
+        // (libpdx-audit has no per-verb kind to mint; see this file's
+        // preamble note (3)), now correlated to the record stream it
+        // actually emits.
+        lea r11, [rip + _remove_audit_id];
+        mov rdi, [r11];                      // audit_id
+        lea rsi, [rip + REMOVE_PROGRESS_HASH];
+        call audit_record_op_output;
+
         xor r12, r12;                        // remove_id
-        xor r13, r13;                        // TXN slot
-        xor r14, r14;                        // seam scratch
+        // r13 = TXN_SLOT_NONE. 0 would be a bug -- cap_slot 0 IS a
+        // valid txn_open return, so the epilogue's abort gate must be
+        // able to tell "never opened" from "opened as slot 0". 0xFFFF
+        // is >= TXN_SLOT_CAP_MAX (256) and so is unambiguous. (The M2
+        // body used 0 here and gated on `cmp r13, 0`, which silently
+        // skipped the abort for a transaction legitimately opened at
+        // slot 0 -- fixed at R70.M1-005 in step with install.pdx's own
+        // fix of the identical bug.)
+        mov r13, 0xFFFF;                     // TXN slot = none
+        xor r14, r14;                        // file count
         xor r15, r15;                        // exit code = 0
 
         // Step 1: pos_count == 2 check.
@@ -321,8 +762,9 @@ module Remove = structure {
 
         // ---- ENH-007 (#32) --dry-run short-circuit --------------------
         // If --dry-run was set on argv, emit "would remove '<name>'"
-        // and short-circuit. r13 == 0 (from the scratch init above)
-        // means pr_epilogue's txn_abort gate skips cleanly.
+        // and short-circuit. r13 == 0xFFFF (TXN_SLOT_NONE, from the
+        // scratch init above) means pr_epilogue's txn_abort gate skips
+        // cleanly -- no transaction was ever opened.
         call pkg_dry_run_is_set;
         cmp rax, 0;
         je  pr_pipeline;
@@ -382,7 +824,7 @@ module Remove = structure {
         // will consume it. remove is destructive (trash-move + DELETE
         // txn) and D4 forbids ambient write authority on /pkgs for any
         // mutating path, not install alone. Wired here -- ahead of the
-        // /system/packages/ readdir gate closing -- so remove never
+        // registry-lookup gate closing -- so remove never
         // gains a live unelevated destructive path once that gate
         // lands; a silent grant-then-write ordering bug would be much
         // harder to catch after the fact than a stage that already
@@ -396,19 +838,191 @@ module Remove = structure {
         lea r11, [rip + remove_parent_slot];
         mov [r11], rax;                      // 0 today; live slot post-M2
 
-        // Step 2: lookup /system/packages/<name>-* -- SEAM.
-        // KIND_PDXFS_FILE at HEAD has no readdir; this step
-        // unconditionally refuses at M2 with a diagnostic naming the
-        // missing substrate. M3 wires the readdir extension OR reads
-        // /system/packages/index.pdxlist per architecture.md §M2.
+        mov rdi, 1;                          // REMOVE_STEP_ELEVATE
+        lea r11, [rip + remove_parent_slot];
+        mov rsi, [r11];                      // rc = granted slot (0 today)
+        call ps_emit_remove_progress;
+
+        // ---- Step 2: registry lookup ----------------------------------
+        // Resolve <name> against /system/packages/index.pdxlist and
+        // populate _remove_inventory. Was an unconditional
+        // `jmp pr_err_lookup` at M2; now a real call whose refusal
+        // lives in its return value, so closing the substrate gap is an
+        // edit to remove_lookup_files alone. See its header for why the
+        // registry is index.pdxlist and not /var/pkg/installed.pdxpkg.
         mov r11, 2;                          // REMOVE_STEP_LOOKUP
         lea rax, [rip + remove_step];
         mov [rax], r11;
 
-        // Deliberate fall-through to the lookup-error branch. When
-        // the substrate lands, this jmp is replaced with the real
-        // lookup call and its refusal-path becomes conditional.
-        jmp pr_err_lookup;
+        mov rdi, rbx;                        // name_ptr
+        call remove_lookup_files;
+        mov r14, rax;                        // file count | sentinel
+
+        mov rdi, 2;                          // REMOVE_STEP_LOOKUP
+        mov rsi, r14;
+        call ps_emit_remove_progress;
+
+        // Refuse on any 0xFFFFEB8x-band sentinel, and ALSO on a zero
+        // count. Zero is not a benign "nothing to do" here: it would
+        // carry the pipeline through txn_open, an undo record
+        // describing nothing, and a successful commit, and report
+        // `files=0` for a package that was never touched -- a silent
+        // no-op wearing a success exit code, which is precisely the
+        // I5 failure the refuse-closed discipline exists to prevent.
+        mov r11, 0xFFFFEB80;
+        cmp r14, r11;
+        jae pr_err_lookup;
+        cmp r14, 0;
+        je  pr_err_lookup;
+
+        // ---- Step 3: open the DELETE transaction -----------------------
+        // Every unlink below is staged inside THIS transaction, so the
+        // epilogue's txn_abort rolls back the entire file set on any
+        // later failure. txn_id = remove_id (r12), which remove_id_next
+        // guarantees non-zero per the PXT_MINT_BAD_ID gate.
+        mov r11, 3;                          // REMOVE_STEP_TXN_OPEN
+        lea rax, [rip + remove_step];
+        mov [rax], r11;
+
+        lea r11, [rip + remove_parent_slot];
+        mov rdi, [r11];                      // parent_slot (elevate-granted)
+        mov rsi, 3;                          // TXN_MODE_DELETE
+        mov rdx, r12;                        // txn_id = remove_id
+        xor rcx, rcx;                        // wal_off (kernel picks)
+        call txn_open;
+        mov r13, rax;
+        lea r11, [rip + remove_txn_slot];
+        mov [r11], r13;
+
+        mov rdi, 3;                          // REMOVE_STEP_TXN_OPEN
+        mov rsi, r13;
+        call ps_emit_remove_progress;
+
+        // Success is a cap_slot in [0, 256); anything at or above is a
+        // mint sentinel (0xFFFFEC1x band, incl. PXT_MINT_BAD_PARENT
+        // while the elevate broker stays unregistered) or -ENFILE.
+        mov r11, 256;                        // TXN_SLOT_CAP_MAX
+        cmp r13, r11;
+        jae pr_err_txn;
+
+        // ---- Step 4: serialise the pdxundo header ----------------------
+        // I5: the undo record is written BEFORE any file is unlinked.
+        // Ordering is the whole point -- a record written after the
+        // deletions would be unrecoverable exactly when it is needed.
+        // ur_write_header had no caller at all before this round.
+        //
+        // removed_ns is 0: pkg has no wall-clock wrapper yet (no
+        // sys_clock_gettime binding in this tool's caps.decl), and a
+        // fabricated timestamp in a durable record is worse than an
+        // explicit zero a reader can recognise as "unset".
+        // body_len is 0 and body_sha3 is the 16B zero blob because the
+        // FILE_TRASH_ENTRY body loop lands with the trash-move at M4.
+        mov r11, 4;                          // REMOVE_STEP_UNDO
+        lea rax, [rip + remove_step];
+        mov [rax], r11;
+
+        lea rdi, [rip + _undo_scratch];      // buf_ptr
+        mov rsi, r12;                        // remove_id
+        xor rdx, rdx;                        // removed_ns (no clock wrapper)
+        mov r11, 0x4E94914F0000;             // UR_DEFAULT_RETENTION_NS
+        mov rcx, r11;                        // replay_deadline_ns
+        xor r8, r8;                          // body_len (body loop at M4)
+        lea r9, [rip + _undo_body_sha3];     // body_sha3_ptr (16B zero)
+        call ur_write_header;
+        lea r11, [rip + remove_last_rc];
+        mov [r11], rax;
+
+        mov rdi, 4;                          // REMOVE_STEP_UNDO
+        lea r11, [rip + remove_last_rc];
+        mov rsi, [r11];
+        call ps_emit_remove_progress;
+
+        lea r11, [rip + remove_last_rc];
+        mov rax, [r11];
+        cmp rax, 0;                          // UR_OK
+        jne pr_err_undo;
+
+        // ---- Step 5: unlink every recorded file inside the txn ---------
+        // Issue #22 steps 2+3, via PXT_OP_UNLINK rather than a
+        // sys_unlink loop. See remove_unlink_all's header for why the
+        // transactional form is required and not merely preferred.
+        mov r11, 5;                          // REMOVE_STEP_TRASH
+        lea rax, [rip + remove_step];
+        mov [rax], r11;
+
+        mov rdi, r13;                        // txn slot
+        call remove_unlink_all;
+        lea r11, [rip + remove_last_rc];
+        mov [r11], rax;
+
+        mov rdi, 5;                          // REMOVE_STEP_TRASH
+        lea r11, [rip + remove_last_rc];
+        mov rsi, [r11];
+        call ps_emit_remove_progress;
+
+        lea r11, [rip + remove_last_rc];
+        mov rax, [r11];
+        cmp rax, 0;                          // TXN_OK
+        jne pr_err_unlink;
+
+        // ---- Step 6: commit --------------------------------------------
+        // The registry deregistration (#22 step 5) is staged in this
+        // same transaction as the unlinks, so there is no window in
+        // which the files are gone but index.pdxlist still advertises
+        // the package as installed. That staging lands with the
+        // registry writer, behind the same cap gap as the lookup.
+        mov r11, 6;                          // REMOVE_STEP_COMMIT
+        lea rax, [rip + remove_step];
+        mov [rax], r11;
+
+        mov rdi, r13;                        // slot
+        call txn_commit;
+        lea r11, [rip + remove_last_rc];
+        mov [r11], rax;
+
+        mov rdi, 6;                          // REMOVE_STEP_COMMIT
+        lea r11, [rip + remove_last_rc];
+        mov rsi, [r11];
+        call ps_emit_remove_progress;
+
+        lea r11, [rip + remove_last_rc];
+        mov rax, [r11];
+        cmp rax, 0;                          // TXN_OK
+        jne pr_err_txn;
+
+        // ---- Success fingerprint ---------------------------------------
+        // "pkg remove: ok -- name='<name>' files=<N>\n"
+        lea rdi, [rip + REMOVE_OK_MSG_1];
+        mov rsi, 24;                         // REMOVE_OK_MSG_1_LEN
+        call print_str;
+
+        mov rdx, rbx;
+      pr_ok_name_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je  pr_ok_name_walk_done;
+        add rdx, 1;
+        jmp pr_ok_name_walk;
+      pr_ok_name_walk_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call print_str;
+
+        lea rdi, [rip + REMOVE_OK_MSG_2];
+        mov rsi, 8;                          // REMOVE_OK_MSG_2_LEN
+        call print_str;
+
+        mov rdi, r14;                        // file count
+        call remove_print_u64;
+
+        lea rdi, [rip + REMOVE_OK_MSG_3];
+        mov rsi, 1;                          // REMOVE_OK_MSG_3_LEN
+        call print_str;
+
+        xor r15, r15;                        // EXIT_OK
+        jmp pr_epilogue;
 
       // ==== error branches ====
       pr_usage_error:
@@ -420,14 +1034,25 @@ module Remove = structure {
 
       pr_err_lookup:
         lea rdi, [rip + REMOVE_ERR_LOOKUP];
-        mov rsi, 63;                         // REMOVE_ERR_LOOKUP_LEN
+        mov rsi, 61;                         // REMOVE_ERR_LOOKUP_LEN
+        call print_err;
+        mov r15, 1;
+        jmp pr_epilogue;
+
+      pr_err_unlink:
+        // The transaction opened and the undo record was written; what
+        // refused is PXT_OP_UNLINK itself. r13 holds a live slot, so
+        // the epilogue's txn_abort rolls back whatever was staged --
+        // which is what makes fail-fast safe here.
+        lea rdi, [rip + REMOVE_ERR_UNLINK];
+        mov rsi, 58;                         // REMOVE_ERR_UNLINK_LEN
         call print_err;
         mov r15, 1;
         jmp pr_epilogue;
 
       pr_err_txn:
         lea rdi, [rip + REMOVE_ERR_TXN];
-        mov rsi, 65;                         // REMOVE_ERR_TXN_LEN
+        mov rsi, 64;                         // REMOVE_ERR_TXN_LEN
         call print_err;
         mov r15, 1;
         jmp pr_epilogue;
@@ -439,11 +1064,27 @@ module Remove = structure {
         mov r15, 1;
 
       pr_epilogue:
-        // If a txn was opened, abort it (best-effort).
-        mov r11, 0xFFFFEA00;
+        // Cleanup: abort the transaction iff one was actually opened
+        // AND we bailed. Two fixes over the M2 gate here:
+        //
+        //   (a) The old gate was `cmp r13, 0xFFFFEA00; jae skip;
+        //       cmp r13, 0; je skip`, which skipped the abort for a
+        //       transaction legitimately opened at cap_slot 0 --
+        //       conflating a valid slot with the "never opened"
+        //       sentinel and leaking an open transaction on every
+        //       failure path that hit slot 0. r13 now initialises to
+        //       0xFFFF and the gate is the same `jae TXN_SLOT_CAP_MAX`
+        //       range check txn_open's own contract specifies and
+        //       install.pdx already uses.
+        //
+        //   (b) The old gate aborted even after a SUCCESSFUL commit,
+        //       which would drive the row COMMITTED -> abort and
+        //       surface PXT_BAD_TRANSITION on every clean remove. Now
+        //       gated on r15 != 0 (we bailed), matching install.pdx.
+        mov r11, 256;                        // TXN_SLOT_CAP_MAX
         cmp r13, r11;
         jae pr_ep_return;
-        cmp r13, 0;
+        cmp r15, 0;
         je  pr_ep_return;
         mov rdi, r13;
         call txn_abort;

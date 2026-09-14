@@ -49,6 +49,30 @@ module TxnClient = structure {
   pub let TXN_BAD_ARG  : u64 = 0xFFFFEA82
   pub let TXN_KERNEL   : u64 = 0xFFFFEA83   // cap_invoke returned a fault
 
+  // R70.M1-005 (#22): PXT_OP_UNLINK exists and is REAL kernel-side
+  // (paideia-os R52.M6-003 #1711 -- it durably appends a JOP_DENTRY_DEL
+  // + JOP_INODE_WRITE pair under one txn_id), but it is NOT REACHABLE
+  // from userspace: the op's operands (parent_inode, name_ptr,
+  // name_len) travel out-of-band through the kernel-internal
+  // `pdxfs_txn_stage_unlink_name(row_id, parent_inode, name_ptr,
+  // name_len)` staging table, and that function has no syscall
+  // binding at paideia-os HEAD (its own header flags this as a KNOWN
+  // GAP: "no caller in this landing calls this function yet ...
+  // flagged for whichever future issue wires a real vops/syscall path
+  // to UNLINK"). cap_invoke's 3-register dispatch surface cannot carry
+  // the operands inline -- op_arg's upper 56 bits are hard-refused by
+  // cap_handler_pdxfs_txn for EVERY op.
+  //
+  // This sentinel is what txn_unlink returns instead of issuing the
+  // cap_invoke. Issuing it would be strictly worse than refusing: an
+  // unstaged row reads back parent_inode = 0 / name_ptr = 0 /
+  // name_len = 0, so the kernel would emit a dentry-delete against a
+  // NULL name under the root inode -- a blind unlink whose target the
+  // caller never named. Refusing keeps the I5 obligation intact (a
+  // remove that cannot be performed exactly must refuse, not
+  // approximate).
+  pub let TXN_UNLINK_UNSTAGED : u64 = 0xFFFFEA84
+
   // ---- Op codes -- mirror kind_pdxfs_txn.pdx PXT_OP_* -----------------
   // Read-side (existing at paideia-os HEAD):
   pub let TXN_OP_QUERY_ID    : u64 = 0
@@ -61,6 +85,9 @@ module TxnClient = structure {
   // Write-side (R42-PREP-007 landed):
   pub let TXN_OP_COMMIT      : u64 = 7
   pub let TXN_OP_ABORT       : u64 = 8
+  pub let TXN_OP_CREATE      : u64 = 9
+  pub let TXN_OP_RENAME      : u64 = 10
+  pub let TXN_OP_UNLINK      : u64 = 11
 
   // ---- Syscall ids ----------------------------------------------------
   pub let SYS_CAP_INVOKE      : u64 = 4
@@ -243,6 +270,76 @@ module TxnClient = structure {
 
       tc_ab_kernel:
         mov rax, 0xFFFFEA83;                 // TXN_KERNEL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // txn_unlink(slot, path_ptr, path_len) -> TXN_OK
+  //                                       | TXN_BAD_ARG
+  //                                       | TXN_UNLINK_UNSTAGED
+  //                                       | TXN_KERNEL
+  //
+  // R70.M1-005 (#22). Remove ONE path from within an already-open
+  // KIND_PDXFS_TXN opened in TXN_MODE_DELETE. This is the
+  // capability-correct deletion primitive for `pkg remove`: every file
+  // the package installed is unlinked inside the SAME transaction, so
+  // a failure partway through the file list aborts the whole set
+  // rather than leaving a half-removed package on disk. A per-file
+  // `sys_unlink` (syscall #81) loop would be the POSIX shape and is
+  // explicitly NOT what this repo does -- see design/remove-flow.md
+  // §8 for the rejection rationale (ambient authority vs. D4; no
+  // atomicity vs. I5).
+  //
+  // CURRENT STATE: SEAM. See TXN_UNLINK_UNSTAGED above for why this
+  // refuses rather than issuing cap_invoke(slot, PXT_OP_UNLINK). The
+  // arguments are validated first so that the day paideia-os exposes
+  // a staging syscall, the only edit here is replacing the refusal
+  // with the two-call sequence:
+  //
+  //     mov rdi, <SYS_PDXFS_TXN_STAGE_UNLINK>;  // staging syscall
+  //     mov rsi, <row_id from slot>;
+  //     mov rdx, <parent_inode>;
+  //     mov rcx, path_ptr;  mov r8, path_len;
+  //     syscall;
+  //     // then, exactly as txn_commit/txn_abort do:
+  //     mov rsi, slot;  mov rdi, 4;  mov rdx, 11;  syscall;
+  //
+  // -- i.e. the cap_invoke half is already a solved shape in this
+  // module; only the staging half is missing upstream.
+  //
+  // Argument validation is real today and worth keeping ahead of the
+  // seam: a zero path_ptr or zero path_len is a caller bug that must
+  // not be papered over by the seam's refusal, or it will resurface
+  // as a blind unlink the moment the seam closes.
+  //
+  // Leaf function; no callee-save touched; no syscall issued today
+  // (the sysreg effect is declared anyway so the signature does not
+  // have to widen when the syscall lands).
+  // ==========================================================================
+  pub let txn_unlink : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (slot: u64) (path_ptr: u64) (path_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.R70.M1-005 (#22) txn_unlink: per-file deletion inside an open TXN_MODE_DELETE transaction, the capability-correct replacement for a POSIX sys_unlink loop. Validates (slot < TXN_SLOT_CAP_MAX, path_ptr != 0, path_len != 0) then refuses with TXN_UNLINK_UNSTAGED because PXT_OP_UNLINK's operands travel through the kernel-internal pdxfs_txn_stage_unlink_name staging table, which has no syscall binding at paideia-os HEAD (#1711's own KNOWN GAP). Issuing cap_invoke(slot, 11) against an unstaged row would emit a dentry-delete for a NULL name under inode 0 -- a blind unlink -- so refusing is the I5-correct behaviour, not a convenience. Validation runs BEFORE the refusal deliberately so caller bugs surface now rather than at seam-close. slot bound-check uses cmp reg, 256 (imm32-safe, no r11 staging needed); the two large sentinels are returned via mov-imm which paideia-as encodes as a 64-bit load. Leaf; no callee-save touched. Labels prefixed tc_ul_.",
+      block: {
+        // Validate slot is a plausible cap_table slot.
+        mov r11, 256;                        // TXN_SLOT_CAP_MAX
+        cmp rdi, r11;
+        jae tc_ul_bad_arg;
+
+        // Validate the path operand pair.
+        cmp rsi, 0;                          // path_ptr
+        je  tc_ul_bad_arg;
+        cmp rdx, 0;                          // path_len
+        je  tc_ul_bad_arg;
+
+        // SEAM: staging syscall absent upstream -- refuse rather than
+        // issue a blind cap_invoke(slot, PXT_OP_UNLINK).
+        mov rax, 0xFFFFEA84;                 // TXN_UNLINK_UNSTAGED
+        ret;
+
+      tc_ul_bad_arg:
+        mov rax, 0xFFFFEA82;                 // TXN_BAD_ARG
         ret
       }
     }

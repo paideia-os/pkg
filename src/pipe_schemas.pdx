@@ -79,6 +79,16 @@ module PipeSchemas = structure {
   pub let INSTALL_PROGRESS_HASH : [u8; 32] =
     "pdxsig.pkg.ipr.v1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
 
+  // R70.M1-005 (#22): RemoveProgressRecord. Deliberately a SEPARATE
+  // schema from InstallProgressRecord rather than a reused ipr with a
+  // direction flag -- a supervisor filtering the record stream for
+  // "what was deleted on this host" must not have to parse a payload
+  // field to tell a destructive stage from a constructive one. Same
+  // 16-byte (step_id | rc) body shape; different hash.
+  //   "pdxsig.pkg.rpr.v1"  = 17 chars + 15 NUL pad  = 32
+  pub let REMOVE_PROGRESS_HASH : [u8; 32] =
+    "pdxsig.pkg.rpr.v1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+
   // ---- Composition scratch --------------------------------------------
   // One PackageManifest record: 8B name_len + up to 4048 bytes name.
   // Cap the name at 256 bytes -- a realistic package name is <= 64
@@ -93,6 +103,14 @@ module PipeSchemas = structure {
   pub let PS_IPR_BODY_LEN  : u64 = 16
   pub let mut _ipr_scratch : [u8; 16]  = uninit @align(8)
 
+  // One RemoveProgressRecord: same 8B step_id + 8B rc = 16 bytes.
+  // Its own scratch rather than sharing _ipr_scratch: an M4 test
+  // harness that drives install and remove inside one binary would
+  // otherwise see the two compose paths alias, and a partially
+  // composed record is exactly the failure a shared buffer hides.
+  pub let PS_RPR_BODY_LEN  : u64 = 16
+  pub let mut _rpr_scratch : [u8; 16]  = uninit @align(8)
+
   // ---- .bss binding flags ---------------------------------------------
   // Set the first time a bind-* is called so a follow-up call skips
   // the re-bind (libpdx-semantic-pipe Binding refuses SP_ERR_ALREADY_
@@ -100,6 +118,7 @@ module PipeSchemas = structure {
   // dodge that by tracking the bind state per-schema here).
   pub let mut _pmf_bound : u64 = uninit @align(8)
   pub let mut _ipr_bound : u64 = uninit @align(8)
+  pub let mut _rpr_bound : u64 = uninit @align(8)
 
   // ==========================================================================
   // ps_reset() -> ()
@@ -112,11 +131,12 @@ module PipeSchemas = structure {
   pub let ps_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "pkg.M3-001 ps_reset: zero _pmf_bound + _ipr_bound so a subsequent bind fires the underlying libpdx-semantic-pipe bind call. Leaf function; r11 scratch. Labels: none.",
+      justification: "pkg.M3-001 ps_reset, widened at R70.M1-005 (#22) for _rpr_bound: zero every bind flag so a subsequent bind fires the underlying libpdx-semantic-pipe bind call. Leaf function; r11 scratch. Labels: none.",
       block: {
         xor rax, rax;
         lea r11, [rip + _pmf_bound]; mov [r11], rax;
         lea r11, [rip + _ipr_bound]; mov [r11], rax;
+        lea r11, [rip + _rpr_bound]; mov [r11], rax;
         ret
       }
     }
@@ -212,6 +232,54 @@ module PipeSchemas = structure {
 
       ps_bip_fail:
         mov rax, 0xFFFFEB91;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ps_bind_remove_progress() -> PS_OK | PS_ERR_BIND_FAIL
+  //
+  // R70.M1-005 (#22). Mirror of ps_bind_install_progress against
+  // REMOVE_PROGRESS_HASH, with its own bind flag.
+  //
+  // NB on fd sharing: pkg is a single-subcommand process, so exactly
+  // one of {pmf, ipr, rpr} is ever bound to fd 1 in a given run. The
+  // three flags are independent rather than one shared "stdout is
+  // bound" flag precisely so that an M4 test harness driving several
+  // bodies in one binary observes the SP_ERR_ALREADY_BOUND refusal
+  // from libpdx-semantic-pipe instead of silently emitting records
+  // under the previous body's schema hash.
+  // ==========================================================================
+  pub let ps_bind_remove_progress : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pkg.R70.M1-005 (#22) ps_bind_remove_progress: idempotent bind on the RemoveProgressRecord schema hash. Same shape as ps_bind_install_progress / ps_bind_pkg_manifest -- fast-path on _rpr_bound != 0, else Binding::libpdx_semantic_pipe_bind(1, &REMOVE_PROGRESS_HASH), set the flag on SP_OK, PS_ERR_BIND_FAIL (staged via the mov-imm return) otherwise. 1 push (rbx) keeps rsp%16 == 0 for the nested bind call. Labels prefixed ps_brp_ (disjoint from ps_bpm_ / ps_bip_).",
+      block: {
+        push rbx;
+
+        lea r11, [rip + _rpr_bound];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne ps_brp_already;
+
+        mov rdi, 1;                              // PS_FD_STDOUT
+        lea rsi, [rip + REMOVE_PROGRESS_HASH];
+        call libpdx_semantic_pipe_bind;
+        cmp rax, 0;                              // SP_OK
+        jne ps_brp_fail;
+
+        mov rax, 1;
+        lea r11, [rip + _rpr_bound];
+        mov [r11], rax;
+
+      ps_brp_already:
+        xor rax, rax;                            // PS_OK
+        pop rbx;
+        ret;
+
+      ps_brp_fail:
+        mov rax, 0xFFFFEB91;                     // PS_ERR_BIND_FAIL
         pop rbx;
         ret
       }
@@ -372,6 +440,65 @@ module PipeSchemas = structure {
 
       ps_ei_send_fail:
         mov rax, 0xFFFFEB92;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ps_emit_remove_progress(step_id, rc) -> PS_OK | PS_ERR_SEND_FAIL
+  //
+  // R70.M1-005 (#22). Serialise one RemoveProgressRecord into
+  // _rpr_scratch:
+  //
+  //   qword @0 : step_id (u64; Remove::REMOVE_STEP_*)
+  //   qword @8 : rc      (u64)
+  //
+  // Then call Send::send_record(1, &_rpr_scratch, 16).
+  //
+  // The UNLINK stage passes the number of files unlinked as `rc` on
+  // success, which is what makes the issue's `files=<N>` fingerprint
+  // machine-readable as well as human-readable -- a supervisor does
+  // not have to scrape the text line to learn the blast radius of a
+  // remove.
+  //
+  // Register plan mirrors ps_emit_install_progress exactly (2-push
+  // callee-save + one 8-byte pad: entry rsp%16 == 8 -> 0).
+  // ==========================================================================
+  pub let ps_emit_remove_progress : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (step_id: u64) (rc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "pkg.R70.M1-005 (#22) ps_emit_remove_progress: compose + send one RemoveProgressRecord (16B fixed body = step_id | rc) into _rpr_scratch, then Send::send_record(1, &_rpr_scratch, 16). Byte-for-byte the ps_emit_install_progress shape with the remove-side scratch buffer substituted, so the two emitters stay diff-comparable; only the schema hash bound to the fd distinguishes the two record streams. 2 callee-save pushes + sub rsp,8 pad = 24; entry rsp%16 == 8 -> post-prologue == 0 for the nested send_record call. Send failure surfaces as PS_ERR_SEND_FAIL; the caller in remove.pdx ignores it (the text side of stderr/stdout still renders). Labels prefixed ps_er_ (disjoint from ps_ei_).",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // step_id
+        mov r12, rsi;                            // rc
+
+        lea r11, [rip + _rpr_scratch];
+        mov [r11 + 0], rbx;
+        mov [r11 + 8], r12;
+
+        // send_record(1, &_rpr_scratch, 16).
+        mov rdi, 1;                              // PS_FD_STDOUT
+        lea rsi, [rip + _rpr_scratch];
+        mov rdx, 16;                             // PS_RPR_BODY_LEN
+        call send_record;
+        cmp rax, 0;
+        jne ps_er_send_fail;
+
+        xor rax, rax;                            // PS_OK
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ps_er_send_fail:
+        mov rax, 0xFFFFEB92;                     // PS_ERR_SEND_FAIL
         add rsp, 8;
         pop r12;
         pop rbx;

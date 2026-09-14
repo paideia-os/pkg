@@ -4,6 +4,65 @@ All notable changes to this repo are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with
 per-milestone attribution.
 
+## 1.3.0 — R70.M1-005 (2026-09-13, unreleased)
+
+`pkg remove <name>` moves from an M2 shape that refused at a hardcoded
+`jmp` to an end-to-end wired pipeline that fails closed at two named
+upstream gaps. Full disposition record: `design/remove-flow.md` §8.
+
+- `#22` R70.M1-005 — `pkg remove <name>`. The issue asked for a
+  registry parse of `/var/pkg/installed.pdxpkg`, a `sys_unlink` loop,
+  and an audit record of kind `UNINSTALL`. None of the three survive
+  contact with the shipped substrate, and §8 records why:
+  - `/var/pkg/installed.pdxpkg` was **retired** by ENH-001 §2.1 in
+    favour of `/system/packages/index.pdxlist`; re-adding it would
+    give pkg two disagreeing sources of truth with no reconciler.
+    `remove_lookup_files` (new) names the index.
+  - `sys_unlink` is ambient `/pkgs` write authority (D4) and
+    non-transactional (I5): a failure at file *k* of *N* leaves a
+    half-removed package no undo record covers. Replaced by
+    `TxnClient::txn_unlink` (new) — `PXT_OP_UNLINK` inside the DELETE
+    transaction — driven by `remove_unlink_all` (new).
+  - Audit kind `UNINSTALL` **does not exist**; libpdx-audit keys on the
+    `op_name` column, and pkg has emitted `TOOL_INVOKE`/`TOOL_EXIT`
+    under `"remove"` since M3-003. What *was* missing: ENH-012 (#37)
+    wired `audit_record_op_output` into install and list and skipped
+    remove, leaving the one destructive subcommand with an empty
+    `output_schema` column. Now fixed.
+- New `pdxsig.pkg.rpr.v1` (`RemoveProgressRecord`) schema —
+  `ps_bind_remove_progress` / `ps_emit_remove_progress` in
+  `src/pipe_schemas.pdx`. Distinct from `InstallProgressRecord` so a
+  supervisor filtering for destructive operations need not parse a
+  payload field. One record per stage carrying that stage's real `rc`;
+  the unlink stage carries the file count, so `files=<N>` is
+  machine-readable, not just printed.
+- `ur_write_header` gains its first caller, ordered **before** any
+  deletion. `removed_ns` is an explicit `0` — pkg has no clock
+  wrapper, and a fabricated timestamp in a durable undo record is
+  worse than a zero a reader can recognise as unset.
+- Success fingerprint `pkg remove: ok -- name='<name>' files=<N>` via
+  `remove_print_u64` (new; the div-by-10 idiom from mount.pdxfs /
+  mkfs.pdxfs).
+- Two epilogue bug fixes on the same path:
+  - `remove_txn_slot`'s "none" sentinel was `0`, which is a **valid**
+    `txn_open` return — the `cmp r13, 0; je skip_abort` gate leaked an
+    open transaction on every failure landing on cap_slot 0. Now
+    `0xFFFF` with the `jae TXN_SLOT_CAP_MAX` range check `install.pdx`
+    already used.
+  - The abort fired even after a **successful** commit, driving the row
+    `COMMITTED -> abort` and surfacing `PXT_BAD_TRANSITION` on every
+    clean remove. Now gated on a non-zero exit code.
+- Upstream ask (paideia-os, not pkg): a syscall binding for
+  `pdxfs_txn_stage_unlink_name`. `PXT_OP_UNLINK` is real since
+  R52.M6-003 (#1711) but its operands travel through a kernel-internal
+  staging table with no user-facing entry point, so the op is
+  unreachable. `txn_unlink` refuses rather than issuing a `cap_invoke`
+  against an unstaged row — that would emit a dentry-delete for a NULL
+  name under inode 0, a blind unlink.
+
+Files: `src/remove.pdx`, `src/txn_client.pdx`, `src/pipe_schemas.pdx`,
+`design/remove-flow.md`, `manifest.pdxproj`.
+
 ## 1.2.0 — Wave Z (2026-09-13, unreleased)
 
 Round-closure drain of the R70 orphan chain plus the two open ENH

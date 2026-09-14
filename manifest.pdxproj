@@ -15,7 +15,7 @@
 # build-out/pkg.caps for the InitCap sidecar packaging step at M5.
 
 name        = pkg
-version     = 1.2.0
+version     = 1.3.0
 kind        = tool
 entry       = PkgMain::pkg_main
 output      = build-out/pkg
@@ -26,7 +26,7 @@ caps_decl   = caps.decl
 sources:
   - src/print.pdx                 # sys_write(fd=1) helper
   - src/audit_wire.pdx            # libpdx-audit wire helper (M3-003)
-  - src/pipe_schemas.pdx          # libpdx-semantic-pipe schema bind/emit (M3-001/M3-002)
+  - src/pipe_schemas.pdx          # libpdx-semantic-pipe schema bind/emit (M3-001/M3-002 + rpr at R70.M1-005 #22)
   - src/pkg_elevate.pdx           # libpdx-elevate wrapper for /pkgs write (M3-004; LE-001 rename)
   - src/kind_package_manifest.pdx # KIND_PACKAGE_MANIFEST = 0x193 (M2-001)
   - src/kind_package_repo.pdx     # KIND_PACKAGE_REPO     = 0x192 (M2-002)
@@ -34,7 +34,7 @@ sources:
   - src/txn_client.pdx            # KIND_PDXFS_TXN userspace wrappers (M3 real syscall)
   - src/dry_run.pdx               # --dry-run flag cache + accessor (ENH-007 #32)
   - src/install.pdx               # `pkg install <name>` body (M2-003 + M3-003 audit + ENH-007 dry-run)
-  - src/remove.pdx                # `pkg remove <name>` body + undo (M2-004 + M3-003 audit + ENH-007 dry-run)
+  - src/remove.pdx                # `pkg remove <name>` body + undo + txn unlink loop (M2-004 + M3-003 audit + ENH-007 dry-run + R70.M1-005 #22)
   - src/verify.pdx                # `pkg verify <name>` real body (ENH-004 #29)
   - src/keys.pdx                  # `pkg keys [list]` real body (ENH-005 #30)
   - src/upgrade.pdx               # `pkg upgrade <name>` skeleton (R70.M1-006 #23, Wave Z)
